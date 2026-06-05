@@ -118,6 +118,14 @@ class ReplicaIndex:
     block_hash this replica emitted for that block. Same token sequence at
     different positions in the chain gets a DIFFERENT hash, so the parent is
     part of the key.
+
+    `tokens_index` is a secondary index used by ``find_best_chain`` when the
+    root-block lookup misses (the ZMQ SUB attached too late to catch the
+    parent=None event for this prefix; CAC-136). It maps a token-tuple to the
+    block_hashes whose tokens equal that tuple. Because vLLM's block hash is a
+    deterministic function of (parent_hash, tokens, extra_keys), a content
+    re-anchor is semantically equivalent to having received the missed root
+    event.
     """
 
     replica_id: str
@@ -126,6 +134,9 @@ class ReplicaIndex:
     # Reverse index: block_hash → (parent_hash, token_tuple). Used to remove
     # entries on BlockRemoved without scanning the whole table.
     by_hash: Dict[int, Tuple[Optional[int], Tuple[int, ...]]] = field(default_factory=dict)
+    # Secondary index: token_tuple → list of block_hashes observed for those
+    # tokens (under any parent). Used for root-miss re-anchoring.
+    tokens_index: Dict[Tuple[int, ...], List[int]] = field(default_factory=dict)
     last_seen: float = 0.0
     events_received: int = 0
 
@@ -136,25 +147,67 @@ class ReplicaIndex:
         if block_hash in self.by_hash and self.by_hash[block_hash] != key:
             old_key = self.by_hash[block_hash]
             self.chain_table.pop(old_key, None)
+            # Also clean the old tokens_index entry; the new one overwrites below.
+            old_tokens = old_key[1]
+            if old_tokens in self.tokens_index:
+                try:
+                    self.tokens_index[old_tokens].remove(block_hash)
+                except ValueError:
+                    pass
+                if not self.tokens_index[old_tokens]:
+                    del self.tokens_index[old_tokens]
         self.chain_table[key] = block_hash
         self.chain_table.move_to_end(key)
         self.by_hash[block_hash] = key
+        # Append to tokens_index unless already present.
+        bucket = self.tokens_index.setdefault(token_tuple, [])
+        if block_hash not in bucket:
+            bucket.append(block_hash)
         if len(self.chain_table) > _MAX_ENTRIES_PER_REPLICA:
             evicted_key, evicted_hash = self.chain_table.popitem(last=False)
             self.by_hash.pop(evicted_hash, None)
+            evicted_tokens = evicted_key[1]
+            if evicted_tokens in self.tokens_index:
+                try:
+                    self.tokens_index[evicted_tokens].remove(evicted_hash)
+                except ValueError:
+                    pass
+                if not self.tokens_index[evicted_tokens]:
+                    del self.tokens_index[evicted_tokens]
         self.last_seen = time.time()
 
     def lookup(self, parent_hash: Optional[int], token_tuple: Tuple[int, ...]) -> Optional[int]:
         return self.chain_table.get((parent_hash, token_tuple))
 
+    def find_by_tokens(self, token_tuple: Tuple[int, ...]) -> Optional[int]:
+        """Return any observed block_hash whose tokens equal token_tuple.
+
+        Used as the content-re-anchor for root-miss in ``find_best_chain``.
+        If multiple block_hashes share these tokens (different parents), return
+        the most recently inserted one — heuristic for "still warm here."
+        """
+        bucket = self.tokens_index.get(token_tuple)
+        if not bucket:
+            return None
+        return bucket[-1]
+
     def remove_hash(self, block_hash: int) -> None:
         key = self.by_hash.pop(block_hash, None)
         if key is not None:
             self.chain_table.pop(key, None)
+            tokens = key[1]
+            if tokens in self.tokens_index:
+                try:
+                    self.tokens_index[tokens].remove(block_hash)
+                except ValueError:
+                    pass
+                if not self.tokens_index[tokens]:
+                    del self.tokens_index[tokens]
 
     def clear(self) -> None:
         self.chain_table.clear()
         self.by_hash.clear()
+        self.tokens_index.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +228,8 @@ class EventIndex:
             "all_blocks_cleared": 0,
             "zmq_errors": 0,
             "decode_errors": 0,
+            "root_reanchor_hits": 0,
+            "replay_batches_received": 0,
         }
 
     def add_replica(self, replica_id: str, upstream_url: str) -> None:
@@ -188,7 +243,16 @@ class EventIndex:
         leading-block chain we've observed. Returns
         ``(replica_id, block_hashes, block_token_counts)``.
 
-        If no replica has even the first block, returns ``(None, [], [])``.
+        Cold-start handling (CAC-136): on the first block we tolerate a
+        root-lookup miss by re-anchoring via the secondary tokens_index. vLLM
+        v1 emits the root BlockStored event (parent=None) only once per
+        prefix, at the moment the engine first caches it; if our SUB attached
+        after that moment the event is lost to ZMQ slow-joiner. Because vLLM's
+        block hash is a deterministic function of (parent, tokens, extra_keys),
+        a content re-anchor is semantically equivalent to receiving the missed
+        root event.
+
+        If no replica has any matching leading-block, returns ``(None, [], [])``.
         """
         bs = self.block_size
         if bs <= 0 or len(token_ids) < bs:
@@ -205,6 +269,13 @@ class EventIndex:
             while pos + bs <= len(token_ids):
                 block = tuple(token_ids[pos : pos + bs])
                 h = rep.lookup(parent, block)
+                if h is None and parent is None and not hashes:
+                    # Root miss: try content re-anchor (CAC-136).
+                    h = rep.find_by_tokens(block)
+                    if h is not None:
+                        self.stats["root_reanchor_hits"] = (
+                            self.stats.get("root_reanchor_hits", 0) + 1
+                        )
                 if h is None:
                     break
                 hashes.append(h)
@@ -266,6 +337,85 @@ class EventIndex:
 # ---------------------------------------------------------------------------
 
 
+async def replay_from_router(
+    index: EventIndex,
+    replica_id: str,
+    router_endpoint: str,
+    *,
+    from_seq: int = 0,
+    timeout_s: float = 8.0,
+) -> int:
+    """Drain the publisher's replay buffer for this replica.
+
+    vLLM's ZmqEventPublisher exposes a sidecar ROUTER socket (PUB port + 1
+    by default) that lets a late-joining subscriber request batches from a
+    given sequence number onward. The publisher serves whatever's in its
+    bounded ring buffer (``buffer_steps``, default 10 000 batches).
+
+    Protocol (from vllm/examples/features/kv_events/kv_events_subscriber.py):
+      REQ → 8-byte big-endian seq
+      REP → (seq_bytes, payload) for each buffered batch, then
+            (seq_bytes, b"") as an end-of-replay marker.
+
+    This is the load-bearing fix for CAC-136: a freshly-started subscriber
+    that hits ROUTER replay at seq=0 recovers the root BlockStored events
+    (parent=None) that PUB/SUB dropped during slow-joiner.
+
+    Returns the count of batches successfully applied. Logs and returns 0
+    on connection failure — the proxy keeps running with content-re-anchor
+    as the fallback.
+    """
+    ctx = zmq.asyncio.Context.instance()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, int(timeout_s * 1000))
+    sock.setsockopt(zmq.SNDTIMEO, int(timeout_s * 1000))
+    applied = 0
+    try:
+        sock.connect(router_endpoint)
+        await sock.send(from_seq.to_bytes(8, "big"))
+        logging.info(
+            "zmq_replay.request replica=%s endpoint=%s from_seq=%d",
+            replica_id, router_endpoint, from_seq,
+        )
+        while True:
+            try:
+                frames = await asyncio.wait_for(
+                    sock.recv_multipart(), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "zmq_replay.timeout replica=%s applied=%d", replica_id, applied
+                )
+                break
+            if len(frames) < 2:
+                break
+            seq_bytes, payload = frames[0], frames[1]
+            if not payload:
+                # End-of-replay marker
+                logging.info(
+                    "zmq_replay.done replica=%s endpoint=%s applied=%d",
+                    replica_id, router_endpoint, applied,
+                )
+                break
+            try:
+                batch = _DECODER.decode(payload)
+            except Exception:
+                index.stats["decode_errors"] += 1
+                continue
+            index.apply_batch(replica_id, batch)
+            index.stats["replay_batches_received"] += 1
+            applied += 1
+    except Exception as e:
+        logging.warning(
+            "zmq_replay.error replica=%s endpoint=%s err=%s",
+            replica_id, router_endpoint, e,
+        )
+    finally:
+        sock.close()
+    return applied
+
+
 async def subscribe_replica(
     index: EventIndex,
     replica_id: str,
@@ -273,12 +423,21 @@ async def subscribe_replica(
     topic: str = "kv-events",
     *,
     reconnect_backoff_s: float = 2.0,
+    router_endpoint: Optional[str] = None,
+    initial_settle_s: float = 0.5,
 ) -> None:
     """Long-running task: subscribe to one replica's vLLM ZMQ event stream.
 
-    Reconnects on error after a brief backoff. Cancellation-safe.
+    If ``router_endpoint`` is provided, requests a one-shot replay from
+    seq=0 against that endpoint after the SUB attaches but before the
+    main receive loop starts. This recovers events that ZMQ PUB dropped
+    while our subscriber was still completing its TCP+SUBSCRIBE handshake
+    (the CAC-136 slow-joiner trap).
+
+    Reconnects the SUB on error after a brief backoff. Cancellation-safe.
     """
     ctx = zmq.asyncio.Context.instance()
+    first_attach = True
     while True:
         sock = ctx.socket(zmq.SUB)
         sock.setsockopt(zmq.LINGER, 0)
@@ -289,6 +448,13 @@ async def subscribe_replica(
                 "zmq_subscribe.connected replica=%s endpoint=%s topic=%s",
                 replica_id, endpoint, topic,
             )
+            # Give the TCP + subscription handshake time to settle so the PUB
+            # doesn't drop early events. ROUTER replay covers anything we
+            # still miss in this window.
+            await asyncio.sleep(initial_settle_s)
+            if first_attach and router_endpoint:
+                await replay_from_router(index, replica_id, router_endpoint)
+            first_attach = False
             while True:
                 frames = await sock.recv_multipart()
                 payload = frames[-1] if frames else b""

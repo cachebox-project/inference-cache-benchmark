@@ -361,26 +361,39 @@ def _int_to_be8(h: int) -> bytes:
     return (h & 0xFFFFFFFFFFFFFFFF).to_bytes(8, byteorder="big", signed=False)
 
 
-def _parse_replica_spec(spec: str) -> Tuple[str, str, str]:
-    """Parse `id|zmq_endpoint|http_url`.
+def _parse_replica_spec(spec: str) -> Tuple[str, str, str, Optional[str]]:
+    """Parse `id|zmq_sub_endpoint|http_url[|zmq_router_endpoint]`.
 
     Pipe is the separator because both URLs contain colons (`tcp://host:port`,
     `http://host:port`), which makes a colon-separated tuple ambiguous. The id
     cannot contain a pipe.
+
+    The fourth field (ROUTER endpoint for replay-on-subscribe) is optional;
+    when present, the subscriber requests a seq=0 replay at startup to
+    recover events lost to ZMQ slow-joiner (CAC-136). vLLM's publisher binds
+    the ROUTER on `pub_port + 1` by default.
     """
     parts = spec.split("|")
-    if len(parts) != 3 or not all(parts):
+    if len(parts) not in (3, 4) or not all(parts[:3]):
         raise argparse.ArgumentTypeError(
-            f"--replica spec must be id|zmq_endpoint|http_url (three "
-            f"pipe-separated parts), got: {spec!r}"
+            f"--replica spec must be id|zmq_sub|http_url[|zmq_router] (three "
+            f"or four pipe-separated parts), got: {spec!r}"
         )
-    rid, zmq_endpoint, http_url = parts
+    rid = parts[0]
+    zmq_endpoint = parts[1]
+    http_url = parts[2]
+    zmq_router = parts[3] if len(parts) == 4 and parts[3] else None
     if "://" not in zmq_endpoint or "://" not in http_url:
         raise argparse.ArgumentTypeError(
             f"--replica spec parts 2 and 3 must be URLs with a scheme, got: "
             f"zmq={zmq_endpoint!r} http={http_url!r}"
         )
-    return rid, zmq_endpoint, http_url
+    if zmq_router and "://" not in zmq_router:
+        raise argparse.ArgumentTypeError(
+            f"--replica spec part 4 (zmq_router) must be a URL with a scheme, "
+            f"got: {zmq_router!r}"
+        )
+    return rid, zmq_endpoint, http_url, zmq_router
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -391,7 +404,7 @@ async def main_async(args: argparse.Namespace) -> None:
     )
 
     index = EventIndex()
-    for rid, zmq_ep, http_url in args.replica:
+    for rid, zmq_ep, http_url, _zmq_router in args.replica:
         index.add_replica(rid, http_url)
 
     proxy = LookupProxy(
@@ -403,10 +416,14 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     await proxy.setup()
 
-    # Spin up subscriber tasks
+    # Spin up subscriber tasks. When the spec carries a ROUTER endpoint
+    # (4th field), the subscriber will request seq=0 replay at startup
+    # to recover slow-joiner-lost events (CAC-136).
     subscriber_tasks = [
-        asyncio.create_task(subscribe_replica(index, rid, zmq_ep))
-        for rid, zmq_ep, _ in args.replica
+        asyncio.create_task(
+            subscribe_replica(index, rid, zmq_ep, router_endpoint=zmq_router)
+        )
+        for rid, zmq_ep, _http, zmq_router in args.replica
     ]
 
     app = web.Application()
@@ -455,8 +472,11 @@ def main() -> None:
         action="append",
         type=_parse_replica_spec,
         default=[],
-        help="Replica config: id|zmq_endpoint|http_url. Repeat for each replica. "
-             "Example: 'replica-0|tcp://localhost:15001|http://localhost:38010'",
+        help="Replica config: id|zmq_sub|http_url[|zmq_router]. Repeat per replica. "
+             "The optional 4th field is vLLM's ROUTER replay endpoint (PUB port + 1 "
+             "by default); when present, the proxy requests seq=0 replay at startup "
+             "to recover slow-joiner-lost events. Example: "
+             "'r0|tcp://localhost:15001|http://localhost:38010|tcp://localhost:15101'",
     )
     ap.add_argument("--hash-scheme", default=DEFAULT_HASH_SCHEME)
     ap.add_argument("--log", default=None)
