@@ -176,10 +176,17 @@ class LookupProxy:
         messages = payload.get("messages") or []
         if messages:
             try:
-                ids = self.tokenizer.apply_chat_template(
-                    messages, tokenize=True, add_generation_prompt=True
+                # Render the template to a string first, then tokenize. Some
+                # tokenizer versions return a BatchEncoding from
+                # apply_chat_template(tokenize=True) — a 2-element view of
+                # [input_ids, attention_mask] rather than a flat int list,
+                # which silently collapses to len=2 downstream. Going through
+                # the text path avoids that ambiguity.
+                rendered = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
                 )
-                return list(ids)
+                # The template already includes its own special tokens.
+                return list(self.tokenizer.encode(rendered, add_special_tokens=False))
             except Exception as e:
                 logging.warning("apply_chat_template failed (%s); falling back to concat", e)
                 text = "\n".join(m.get("content", "") for m in messages)
