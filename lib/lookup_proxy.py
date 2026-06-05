@@ -46,13 +46,16 @@ from aiohttp import web
 
 try:
     import grpc
-    import inferencecache_v1alpha1_pb2 as pb
-    import inferencecache_v1alpha1_pb2_grpc as pb_grpc
+    # protoc emits stubs under the proto's package path:
+    #   proto/inferencecache/v1alpha1/inferencecache_pb2.py
+    # PYTHONPATH must include the `proto/` root (NOT the v1alpha1/ leaf).
+    from inferencecache.v1alpha1 import inferencecache_pb2 as pb
+    from inferencecache.v1alpha1 import inferencecache_pb2_grpc as pb_grpc
 except ImportError as e:  # pragma: no cover
     sys.stderr.write(
         f"Could not import inference-cache proto stubs: {e}\n"
-        "Generate them from the inference-cache repo and add the output dir to\n"
-        "PYTHONPATH (or set INFERENCE_CACHE_PROTO_DIR env var). See README.\n"
+        "Generate them with `make proto` (sibling inference-cache repo expected)\n"
+        "or set PYTHONPATH to the directory containing inferencecache/v1alpha1/.\n"
     )
     sys.exit(2)
 

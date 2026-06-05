@@ -42,9 +42,13 @@ proto:
 	  --grpc_python_out=$(PROTO_OUT) \
 	  -I$(INFERENCE_CACHE_REPO)/proto \
 	  $(INFERENCE_CACHE_REPO)/proto/inferencecache/v1alpha1/inferencecache.proto
+	@# Touch __init__.py at every level so Python treats it as a regular package.
+	@# Implicit namespace packages also work, but this is friendlier to older tooling.
 	@touch $(PROTO_OUT)/__init__.py
-	@echo "✓ Stubs generated in $(PROTO_OUT)/"
-	@ls -1 $(PROTO_OUT)/
+	@touch $(PROTO_OUT)/inferencecache/__init__.py
+	@touch $(PROTO_OUT)/inferencecache/v1alpha1/__init__.py
+	@echo "✓ Stubs generated in $(PROTO_OUT)/inferencecache/v1alpha1/"
+	@find $(PROTO_OUT) -name '*_pb2*.py' | sed 's/^/  /'
 
 # ---- install: Python deps ----
 install:
@@ -65,9 +69,9 @@ smoke:
 # the most common "demo gods are angry" causes before genai-bench even starts.
 check-paths:
 	@echo "Checking proto stubs..."
-	@test -f "$(PROTO_OUT)/inferencecache_v1alpha1_pb2.py" || \
+	@test -f "$(PROTO_OUT)/inferencecache/v1alpha1/inferencecache_pb2.py" || \
 	  { echo "  ✗ proto stubs missing. Run: make proto"; exit 1; }
-	@echo "  ✓ proto stubs at $(PROTO_OUT)/"
+	@echo "  ✓ proto stubs at $(PROTO_OUT)/inferencecache/v1alpha1/"
 	@echo "Checking port-forwards..."
 	@curl -fsS -o /dev/null --connect-timeout 2 "$${IC_SERVER_METRICS:-http://localhost:38001/metrics}" \
 	  && echo "  ✓ IC_SERVER_METRICS reachable" \
