@@ -46,15 +46,21 @@ import sys
 # Configuration.
 # ---------------------------------------------------------------------------
 
-NUM_PREFIXES = 200
+NUM_PREFIXES = 600
 QUESTIONS_PER_PREFIX = 5
-WORDS_PER_PREFIX = 5000  # ≈ 7000 Llama tokens at ~1.4 tokens/word
-# Total: 200 × 5 = 1000 prompts; ~7000 tokens each.
-# Working set: 200 × ~7000 = 1.4M prefix tokens.
-# This exceeds Llama-3.1-8B's per-replica KV budget at --max-model-len 8192
-# (~450K-token cache capacity) even when round-robined across 3 replicas
-# (1.4M / 3 ≈ 470K per replica), so vLLM's local prefix cache must evict —
-# putting load on the cache plane's offload tier and routing layer.
+WORDS_PER_PREFIX = 5000  # ≈ 5500–7000 Llama tokens (measured ≈5500 in genai-bench logs)
+# Total: 600 × 5 = 3000 prompts; ~5500 tokens each.
+# Working set: 600 × ~5500 = 3.3M prefix tokens.
+# This is 2.5× Llama-3.1-8B's per-replica KV budget at --max-model-len 8192
+# (~450K-token cache capacity) when round-robined across 3 replicas
+# (3.3M / 3 ≈ 1.1M per replica), and 7× when targeting a single replica —
+# eviction is unavoidable in either case, forcing vLLM's local prefix cache
+# to spill into the LMCache offload tier and exercising the routing layer.
+#
+# Bumped from 200→600 prefixes (CAC-139) to settle whether LMCache T2 is
+# functional: the original 200-prefix size at ~1.1M tokens / 3 pods stayed
+# near T1 capacity and never observably evicted, so LMCache `put` may not
+# have fired at all. The 3× working set removes that ambiguity.
 
 # ---------------------------------------------------------------------------
 # Topical vocabulary — three pools so prefixes look domain-distinct.

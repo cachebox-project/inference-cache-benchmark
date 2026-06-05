@@ -1,17 +1,19 @@
 name: cache-stress
 description: |
-  Cache-pressure workload — 50 distinct ~1500-token prefixes rotated
-  through 500 randomly-ordered requests. Designed to exceed vLLM's
-  in-process prefix cache capacity so inference-cache's marginal value
-  becomes observable.
+  Cache-pressure workload — 600 distinct ~5500-token prefixes rotated
+  through 3000 randomly-ordered requests. Designed to exceed vLLM's
+  in-process prefix cache capacity (across 3-pod spread) so inference-cache's
+  marginal value becomes observable.
 
   Why this scenario exists:
     - The headline `rag-headline` scenario uses a single shared prefix that
       fits in vLLM's local cache forever. vLLM-alone handles every hit;
       LMCache and inference-cache routing have nothing to do.
-    - This scenario sweeps through enough distinct prefixes (~75k total
-      tokens of cacheable prefix content) to evict vLLM's local cache,
-      forcing the offload tier and routing layer to actually contribute.
+    - This scenario sweeps through enough distinct prefixes (~3.3M total
+      tokens of cacheable prefix content) to evict vLLM's local cache even
+      when spread across 3 replicas (≈1.1M tokens per replica vs ≈450K T1
+      capacity per replica), forcing the offload tier and routing layer to
+      actually contribute.
 
   Expected mode-by-mode behaviour:
     baseline  (vanilla vLLM)   — local cache thrashes; repeats to evicted
@@ -46,7 +48,7 @@ genai_bench:
   # Pre-generated prompts file (paths are resolved relative to the harness root).
   dataset_path: scenarios/datasets/cache_stress.txt
   num_concurrency: [4]
-  max_requests_per_run: 1000   # 1000 prompts; long enough to see repeated prefixes after vLLM eviction
+  max_requests_per_run: 3000   # 3000 prompts (600 prefixes × 5 questions); long enough to see repeated prefixes after vLLM eviction
   max_time_per_run: 25         # minutes; cushion for slower-by-design long-prompt tail
 
 ic_metrics:
