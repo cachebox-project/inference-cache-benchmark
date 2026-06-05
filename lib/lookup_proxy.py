@@ -152,22 +152,43 @@ class LookupProxy:
     # ---- core: tokenize, chain-walk, lookup, route -------------------------
 
     def _extract_prompt_tokens(self, payload: dict) -> list:
-        """Convert OpenAI chat-completion messages → token IDs.
+        """Convert OpenAI chat-completion or completion payload → token IDs.
 
-        We use `apply_chat_template(tokenize=True)` so the token sequence
-        matches what vLLM sees when it receives the same /v1/chat/completions
-        payload. Falls back to a plain concatenation if the tokenizer has no
-        chat template (older models).
+        We match vLLM's tokenization path so the resulting block hashes
+        agree with what the engine emits in ZMQ events.
+
+        OpenAI-style payloads come in two shapes:
+          /v1/chat/completions  → {"messages": [{"role":..., "content":...}]}
+          /v1/completions       → {"prompt": "raw text"}
+
+        The legacy `/v1/completions` doesn't apply a chat template; vLLM
+        tokenizes the raw `prompt` field as-is. genai-bench's text-to-text
+        backend defaults to this path.
         """
+        # 1) /v1/completions style — prompt as a string (or list of strings)
+        prompt = payload.get("prompt")
+        if prompt is not None:
+            if isinstance(prompt, list):
+                # OpenAI allows batch prompts; we concatenate for token-budget purposes
+                prompt = "\n".join(str(p) for p in prompt)
+            return list(self.tokenizer.encode(str(prompt), add_special_tokens=True))
+        # 2) /v1/chat/completions style — apply the chat template
         messages = payload.get("messages") or []
-        try:
-            ids = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
-            return list(ids)
-        except Exception:
-            text = "\n".join(m.get("content", "") for m in messages)
-            return list(self.tokenizer.encode(text, add_special_tokens=True))
+        if messages:
+            try:
+                ids = self.tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True
+                )
+                return list(ids)
+            except Exception as e:
+                logging.warning("apply_chat_template failed (%s); falling back to concat", e)
+                text = "\n".join(m.get("content", "") for m in messages)
+                return list(self.tokenizer.encode(text, add_special_tokens=True))
+        logging.warning(
+            "request body has neither 'prompt' nor 'messages'; keys=%s",
+            list(payload.keys()),
+        )
+        return []
 
     async def _lookup_with_chain(
         self,
@@ -381,6 +402,10 @@ async def main_async(args: argparse.Namespace) -> None:
 
     app = web.Application()
     app.router.add_post("/v1/chat/completions", proxy.handle_chat)
+    # genai-bench's text-to-text backend hits /v1/completions by default;
+    # route both through the same handler (handle_chat picks the right
+    # payload shape).
+    app.router.add_post("/v1/completions", proxy.handle_chat)
     app.router.add_get("/proxy/metrics", proxy.handle_metrics)
     app.router.add_get("/health", lambda _r: web.Response(status=200))
 
