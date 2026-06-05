@@ -138,6 +138,13 @@ Generate it first (see the scenario's description for the generator command)."
         color_y "  to zero replicas, observe no events, and return NO_HINT on every"
         color_y "  request — degenerating to no-hint mode. See README §B-b setup."
       fi
+      # LOOKUP_PROXY_EXTRA_ARGS: free-form extra args appended to the proxy
+      # invocation. Useful for --replica-alias or any future flag. Word-split.
+      local -a extra_args=()
+      if [[ -n "${LOOKUP_PROXY_EXTRA_ARGS:-}" ]]; then
+        # shellcheck disable=SC2206
+        extra_args=(${LOOKUP_PROXY_EXTRA_ARGS})
+      fi
       PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$LIB_DIR/lookup_proxy.py" \
         --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \
         --ic-server "$IC_SERVER_GRPC" \
@@ -145,6 +152,7 @@ Generate it first (see the scenario's description for the generator command)."
         --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
         --tenant "${LOOKUP_PROXY_TENANT:-$WORKLOAD_NAMESPACE}" \
         "${replica_args[@]}" \
+        "${extra_args[@]}" \
         --log "$outdir/lookup_proxy.log" &
       PROXY_PID=$!
       sleep 3  # tokenizer load takes a moment; subscriber tasks attaching
