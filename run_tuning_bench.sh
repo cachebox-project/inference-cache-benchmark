@@ -100,7 +100,7 @@ cmd_run() {
   max_req=$(yq -r '.genai_bench.max_requests_per_run' "$cfg")
   max_time=$(yq -r '.genai_bench.max_time_per_run' "$cfg")
   local prefix_len; prefix_len=$(yq -r '.genai_bench.prefix_len // ""' "$cfg")
-  local scenarios; scenarios=$(yq -r '.genai_bench.traffic_scenarios[] // empty' "$cfg")
+  local scenarios; scenarios=$(yq -r '.genai_bench.traffic_scenarios[]?' "$cfg")
   local concurrencies; concurrencies=$(yq -r '.genai_bench.num_concurrency[]' "$cfg")
   local scrape_interval; scrape_interval=$(yq -r '.ic_metrics.scrape_interval_s // 10' "$cfg")
   # Dataset mode (mutually exclusive with traffic_scenarios + prefix_len).
