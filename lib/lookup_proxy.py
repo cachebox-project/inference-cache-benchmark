@@ -248,17 +248,27 @@ class LookupProxy:
     def _pick_upstream(self, hint_replica_id: Optional[str]) -> Tuple[str, str]:
         """Map a hint to an upstream URL. Returns (upstream_url, routing_reason).
 
+        The server returns the kvevent-subscriber's `--replica-id` flag value,
+        which in Helm installs equals the engine pod name. We accept the hint
+        if it matches a configured replica id OR an alias registered for one
+        (see ``--replica-alias``). Aliases let the operator use friendly names
+        in the proxy spec while still resolving server-returned pod-name hints.
+
         Order of preference:
-          1. Hint matches a known replica → use that replica's upstream
-          2. Hint is set but replica unknown to proxy → use default_upstream
-          3. No hint → round-robin among known replicas if available
-             (this is what the harness wants: even on NO_HINT, fan out across
-             replicas so different prefixes land on different pods and the
-             chain table populates faster)
-          4. No known replicas → default_upstream
+          1. Hint matches a known replica id directly → use that upstream
+          2. Hint matches a registered alias → use the aliased replica's upstream
+          3. Hint set but no match → round-robin (so the request still lands
+             on SOME warm replica, even if not the one the server picked)
+          4. No hint → round-robin among known replicas if available
+          5. No known replicas → default_upstream
         """
         if hint_replica_id is not None:
             rep = self.event_index.replicas.get(hint_replica_id)
+            if rep is None:
+                # Try alias resolution
+                target_id = self.event_index.replica_aliases.get(hint_replica_id)
+                if target_id is not None:
+                    rep = self.event_index.replicas.get(target_id)
             if rep is not None:
                 self.stats["routed_to_hint"] += 1
                 return rep.upstream_url, "HINT"
@@ -411,6 +421,18 @@ async def main_async(args: argparse.Namespace) -> None:
     index = EventIndex()
     for rid, zmq_ep, http_url, _zmq_router in args.replica:
         index.add_replica(rid, http_url)
+    # Register aliases: server-returned hint id → local replica id.
+    for spec in args.replica_alias or []:
+        if "=" not in spec:
+            raise argparse.ArgumentTypeError(
+                f"--replica-alias spec must be alias=replica_id, got {spec!r}"
+            )
+        alias, _, target = spec.partition("=")
+        if not alias or not target:
+            raise argparse.ArgumentTypeError(
+                f"--replica-alias spec must be alias=replica_id, got {spec!r}"
+            )
+        index.add_alias(alias, target)
 
     proxy = LookupProxy(
         ic_server=args.ic_server,
@@ -485,6 +507,17 @@ def main() -> None:
              "'r0|tcp://localhost:15001|http://localhost:38010|tcp://localhost:15101'",
     )
     ap.add_argument("--hash-scheme", default=DEFAULT_HASH_SCHEME)
+    ap.add_argument(
+        "--replica-alias",
+        action="append",
+        default=[],
+        help="Map a server-returned hint id to a local replica id. Format: "
+             "'<alias>=<replica_id>'. Repeat per pair. Useful when the proxy "
+             "uses friendly local ids (r0, r1, ...) and the kvevent-subscriber "
+             "sends actual engine pod names — pass the pod-name=local-id "
+             "mapping here so hint routing works without renaming the proxy "
+             "spec on every pod restart.",
+    )
     ap.add_argument(
         "--tenant",
         default="default",

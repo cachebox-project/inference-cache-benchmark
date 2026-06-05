@@ -221,6 +221,10 @@ class EventIndex:
         # Inferred from BlockStored.block_size. Defaults to 16 (vLLM's default
         # KV block size); updated by the first event we receive.
         self.block_size: int = 16
+        # Mapping from server-returned hint id (typically the engine pod name)
+        # to the local replica id used as a chain-table key. Empty by default;
+        # registered via ``add_alias`` from the proxy spec.
+        self.replica_aliases: Dict[str, str] = {}
         self.stats = {
             "events_received": 0,
             "blocks_stored": 0,
@@ -235,6 +239,12 @@ class EventIndex:
     def add_replica(self, replica_id: str, upstream_url: str) -> None:
         if replica_id not in self.replicas:
             self.replicas[replica_id] = ReplicaIndex(replica_id=replica_id, upstream_url=upstream_url)
+
+    def add_alias(self, alias: str, target_replica_id: str) -> None:
+        """Register that the server may return ``alias`` as a hint that should
+        route to the replica known internally as ``target_replica_id``."""
+        if alias and target_replica_id:
+            self.replica_aliases[alias] = target_replica_id
 
     def find_best_chain(
         self, token_ids: List[int], min_blocks: int = 1
