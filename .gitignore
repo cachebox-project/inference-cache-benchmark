@@ -26,6 +26,11 @@ CLAUDE.md
 results/*
 !results/.gitkeep
 
+# Generated scenario datasets — regenerate with `make datasets`
+scenarios/datasets/*.txt
+scenarios/datasets/*.csv
+scenarios/datasets/*.jsonl
+
 # Generated proto stubs (regenerate from inference-cache repo)
 proto/
 *.pb.go

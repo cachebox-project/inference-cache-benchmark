@@ -1,0 +1,66 @@
+name: cache-stress
+description: |
+  Cache-pressure workload — 50 distinct ~1500-token prefixes rotated
+  through 500 randomly-ordered requests. Designed to exceed vLLM's
+  in-process prefix cache capacity so inference-cache's marginal value
+  becomes observable.
+
+  Why this scenario exists:
+    - The headline `rag-headline` scenario uses a single shared prefix that
+      fits in vLLM's local cache forever. vLLM-alone handles every hit;
+      LMCache and inference-cache routing have nothing to do.
+    - This scenario sweeps through enough distinct prefixes (~75k total
+      tokens of cacheable prefix content) to evict vLLM's local cache,
+      forcing the offload tier and routing layer to actually contribute.
+
+  Expected mode-by-mode behaviour:
+    baseline  (vanilla vLLM)   — local cache thrashes; repeats to evicted
+                                  prefixes cost full prefill again. p50 and
+                                  p99 both elevated.
+    no-hint   (cache plane up) — LMCache pulls evicted blocks back from the
+                                  offload tier. p50 recovers; p99 still
+                                  variable.
+    lookup    (full system)    — LookupRoute steers repeat-prefix requests
+                                  to the replica that still has them
+                                  GPU-resident. Best case for hits; falls
+                                  back to no-hint behaviour on miss.
+
+  Use this scenario when:
+    - Validating that inference-cache delivers value beyond vLLM's own
+      prefix cache
+    - Tuning CachePolicy.evictionTTL / maxIndexEntries — this is the
+      workload where TTL and eviction policy actually matter
+    - Stress-testing the routing layer with diverse prefixes
+
+  Setup (one-time):
+    python scenarios/datasets/gen_cache_stress.py
+    # writes scenarios/datasets/cache_stress.txt
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  # Public Llama tokenizer — only used for prompt synthesis budgeting; the
+  # dataset is already pre-generated as raw text.
+  tokenizer: hf-internal-testing/llama-tokenizer
+  # Pre-generated prompts file (paths are resolved relative to the harness root).
+  dataset_path: scenarios/datasets/cache_stress.txt
+  num_concurrency: [4]
+  max_requests_per_run: 500
+  max_time_per_run: 15        # minutes; cushion for the slower-by-design tail
+
+ic_metrics:
+  scrape_interval_s: 10
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_lookup_route_latency_seconds
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+    - inferencecache_policy_auth_total
+
+acceptance:
+  # No fixed TTFT target — cache-stress is for measuring deltas across modes
+  # rather than absolute numbers. Use `compare` after running all three.
+  # We do expect a non-trivial hit rate in lookup mode once the chain table
+  # has observed each prefix at least once.
+  lookup_hit_rate_pct_min: 40

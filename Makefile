@@ -3,7 +3,7 @@
 # Common entry points so you don't have to remember the exact protoc invocation
 # or which port-forwards the run script expects.
 
-.PHONY: help proto install lint smoke clean check-paths
+.PHONY: help proto install lint smoke clean check-paths datasets
 
 # Where the main inference-cache repo lives. Override on the command line:
 #   make proto INFERENCE_CACHE_REPO=/path/to/inference-cache
@@ -13,6 +13,7 @@ PROTO_OUT := proto
 help:
 	@echo "make proto              Regenerate gRPC stubs from INFERENCE_CACHE_REPO/proto/"
 	@echo "make install            Install Python deps (genai-bench, grpcio, aiohttp, ...)"
+	@echo "make datasets           Generate scenario datasets that need precomputed prompts"
 	@echo "make lint               Lint shell + python sources"
 	@echo "make smoke              List available scenarios (sanity check)"
 	@echo "make check-paths        Verify port-forwards and proto stubs before a real run"
@@ -87,6 +88,11 @@ check-paths:
 	@nc -z $${IC_SERVER_GRPC:-localhost:38002 | tr : ' '} 2>/dev/null \
 	  && echo "  ✓ IC_SERVER_GRPC reachable" \
 	  || echo "  ? IC_SERVER_GRPC — port check inconclusive (run a real LookupRoute via grpcurl to confirm)"
+
+# ---- datasets: pre-generated prompts files referenced by scenarios ----
+datasets:
+	@python3 scenarios/datasets/gen_cache_stress.py
+	@echo "✓ Generated all dataset files in scenarios/datasets/"
 
 # ---- clean ----
 clean:
