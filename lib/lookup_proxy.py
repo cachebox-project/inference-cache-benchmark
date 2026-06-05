@@ -112,11 +112,16 @@ class LookupProxy:
         tokenizer_name: str,
         hash_scheme: str,
         event_index: EventIndex,
+        tenant: str = "default",
     ):
         self.ic_server = ic_server
         self.default_upstream = default_upstream.rstrip("/")
         self.hash_scheme = hash_scheme
         self.event_index = event_index
+        # Must match the tenant the engine's kvevent-subscriber sidecar sends
+        # ReportCacheState with (its `--tenant-id` flag — usually the
+        # engine pod's namespace via $(POD_NAMESPACE)).
+        self.tenant = tenant
         self._channel: Optional["grpc.aio.Channel"] = None
         self._stub: Optional[pb_grpc.InferenceCacheStub] = None
         self._client_session: Optional[aiohttp.ClientSession] = None
@@ -282,7 +287,7 @@ class LookupProxy:
         replica_id_local, hashes, counts = self.event_index.find_best_chain(token_ids)
         if hashes:
             hint_replica, reason = await self._lookup_with_chain(
-                tenant="default",
+                tenant=self.tenant,
                 model=model,
                 block_hashes=hashes,
                 block_token_counts=counts,
@@ -413,6 +418,7 @@ async def main_async(args: argparse.Namespace) -> None:
         tokenizer_name=args.tokenizer,
         hash_scheme=args.hash_scheme,
         event_index=index,
+        tenant=args.tenant,
     )
     await proxy.setup()
 
@@ -479,6 +485,15 @@ def main() -> None:
              "'r0|tcp://localhost:15001|http://localhost:38010|tcp://localhost:15101'",
     )
     ap.add_argument("--hash-scheme", default=DEFAULT_HASH_SCHEME)
+    ap.add_argument(
+        "--tenant",
+        default="default",
+        help="Tenant ID for LookupRoute queries. MUST equal the tenant the "
+             "engine's kvevent-subscriber sidecar uses in its ReportCacheState "
+             "calls. Default is the subscriber's flag default — but in most "
+             "Helm installs the subscriber sets --tenant-id=$(POD_NAMESPACE), "
+             "so set this to the namespace your engine pods run in.",
+    )
     ap.add_argument("--log", default=None)
     args = ap.parse_args()
 

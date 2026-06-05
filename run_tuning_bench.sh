@@ -143,6 +143,7 @@ Generate it first (see the scenario's description for the generator command)."
         --ic-server "$IC_SERVER_GRPC" \
         --default-upstream "$VLLM_ENGINE_URL" \
         --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
+        --tenant "${LOOKUP_PROXY_TENANT:-$WORKLOAD_NAMESPACE}" \
         "${replica_args[@]}" \
         --log "$outdir/lookup_proxy.log" &
       PROXY_PID=$!
