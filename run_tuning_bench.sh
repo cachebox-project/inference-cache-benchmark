@@ -8,12 +8,14 @@
 #   clean [--keep-last N]
 #
 # Configuration via env vars (or defaults below):
-#   IC_SERVER_METRICS   — inference-cache server /metrics URL  (default: http://localhost:38001/metrics)
-#   IC_SERVER_GRPC      — inference-cache server gRPC endpoint (default: localhost:38002)
-#   VLLM_ENGINE_URL     — cache-enabled vLLM HTTP URL          (default: http://localhost:38000)
-#   VLLM_BASELINE_URL   — vanilla-vLLM (no cache plane) URL    (default: http://localhost:38005)
-#   LOOKUP_PROXY_PORT   — proxy listen port for `lookup` mode  (default: 18100)
-#   KUBECONFIG          — kubeconfig path for the CRD snapshot (default: from environment)
+#   IC_SERVER_METRICS       — server /metrics URL                (default: http://localhost:38001/metrics)
+#   IC_SERVER_GRPC          — server gRPC endpoint               (default: localhost:38002)
+#   VLLM_ENGINE_URL         — cache-enabled vLLM HTTP URL        (default: http://localhost:38000)
+#   VLLM_BASELINE_URL       — vanilla-vLLM (no cache plane) URL  (default: http://localhost:38005)
+#   LOOKUP_PROXY_PORT       — proxy listen port (lookup mode)    (default: 18100)
+#   LOOKUP_PROXY_TOKENIZER  — HF tokenizer id (lookup mode)      (default: hf-internal-testing/llama-tokenizer)
+#   LOOKUP_PROXY_REPLICAS   — per-replica config (lookup mode)   — see README; required for PREFIX_MATCH
+#   KUBECONFIG              — kubeconfig path for CRD snapshot   (default: from environment)
 #
 # See README.md for the full design.
 
@@ -30,7 +32,12 @@ PROTO_DIR="${INFERENCE_CACHE_PROTO_DIR:-$ROOT/proto}"
 : "${VLLM_ENGINE_URL:=http://localhost:38000}"
 : "${VLLM_BASELINE_URL:=http://localhost:38005}"
 : "${LOOKUP_PROXY_PORT:=18100}"
+: "${LOOKUP_PROXY_TOKENIZER:=hf-internal-testing/llama-tokenizer}"
 : "${WORKLOAD_NAMESPACE:=default}"
+# LOOKUP_PROXY_REPLICAS — comma-separated, one entry per replica.
+# Format: <id>:<zmq_endpoint>:<http_url>
+# Example: "r0:tcp://localhost:15001:http://localhost:38010,r1:tcp://localhost:15002:http://localhost:38011"
+: "${LOOKUP_PROXY_REPLICAS:=}"
 
 # -------- helpers --------
 color_g() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -107,13 +114,27 @@ cmd_run() {
     no-hint)  target_url="$VLLM_ENGINE_URL"   ;;
     lookup)
       color_g "[3/6] Starting LookupRoute proxy on :$LOOKUP_PROXY_PORT"
-      PYTHONPATH="$PROTO_DIR" python3 "$LIB_DIR/lookup_proxy.py" \
+      # Build --replica args from LOOKUP_PROXY_REPLICAS env var (comma-separated)
+      local -a replica_args=()
+      if [[ -n "$LOOKUP_PROXY_REPLICAS" ]]; then
+        IFS=',' read -ra _reps <<< "$LOOKUP_PROXY_REPLICAS"
+        for r in "${_reps[@]}"; do
+          replica_args+=("--replica" "$r")
+        done
+      else
+        color_y "  WARNING: LOOKUP_PROXY_REPLICAS not set. The proxy will subscribe"
+        color_y "  to zero replicas, observe no events, and return NO_HINT on every"
+        color_y "  request — degenerating to no-hint mode. See README §B-b setup."
+      fi
+      PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$LIB_DIR/lookup_proxy.py" \
         --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \
         --ic-server "$IC_SERVER_GRPC" \
-        --upstream "$VLLM_ENGINE_URL" \
+        --default-upstream "$VLLM_ENGINE_URL" \
+        --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
+        "${replica_args[@]}" \
         --log "$outdir/lookup_proxy.log" &
       PROXY_PID=$!
-      sleep 2
+      sleep 3  # tokenizer load takes a moment; subscriber tasks attaching
       kill -0 "$PROXY_PID" 2>/dev/null || die "lookup proxy failed to start; see $outdir/lookup_proxy.log"
       target_url="http://localhost:$LOOKUP_PROXY_PORT"
       ;;

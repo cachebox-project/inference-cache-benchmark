@@ -52,7 +52,12 @@ proto:
 
 # ---- install: Python deps ----
 install:
-	pip install genai-bench 'grpcio>=1.60' grpcio-tools aiohttp pandas pyyaml requests
+	pip install \
+	  genai-bench \
+	  'grpcio>=1.60' grpcio-tools \
+	  aiohttp pandas pyyaml requests \
+	  pyzmq 'msgspec>=0.18' \
+	  transformers sentencepiece
 
 # ---- lint ----
 lint:

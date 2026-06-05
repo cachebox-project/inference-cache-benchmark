@@ -134,6 +134,86 @@ done
 
 The proxy is the bit that mediates between genai-bench's "single endpoint URL" assumption and inference-cache's "list of replicas + a routing hint" model. Without the proxy, genai-bench can't exercise the routing-decision path.
 
+### How `lookup` mode actually works (the B-b architecture)
+
+vLLM's block hashes are computed with `builtins.hash()` by default — process-local and not reproducible across pods. A gateway client that hand-rolls a hash from prompt text will silently produce values that never match anything in the server's index. The proxy avoids this by **observing the engine's emitted hashes** rather than recomputing them.
+
+```
+ZMQ subscriber tasks (one per replica)         per-replica chain table
+    ↓                                                ↓
+listen to BlockStored / BlockRemoved / -→  (parent_hash, token_tuple) → block_hash
+AllBlocksCleared on each replica's :5557
+
+incoming HTTP request
+    ↓
+tokenize prompt (HF AutoTokenizer)
+    ↓
+chunk into B-token blocks (B is auto-detected from BlockStored.block_size)
+    ↓
+walk each replica's chain → find longest leading match across all replicas
+    ↓
+send LookupRoute with that replica's exact block_hashes + token_counts chain
+    ↓
+PREFIX_MATCH → route to hinted replica's HTTP URL
+NO_HINT / TIMEOUT / NO_CHAIN_OBSERVED → round-robin among known replicas
+                                       (falls back to --default-upstream if none)
+```
+
+**Cold-start behavior**: until the proxy has seen events for a prefix, that prefix gets NO_HINT and is routed round-robin. After ~5-10 requests with a shared prefix, the chain table populates and subsequent requests get PREFIX_MATCH. This is exactly how a real gateway integration would behave — and what benchmarks measure during their warmup + steady-state windows.
+
+### Setting up `lookup` mode
+
+You need port-forwards to TWO endpoints per replica:
+
+| Per-replica need | What it's for |
+|---|---|
+| **ZMQ event port** (`:5557` on the pod) | Subscriber listens; vLLM publishes here |
+| **HTTP serve port** (`:8000` on the pod) | Where the proxy forwards requests when it has a hint |
+
+For a 3-replica deployment in namespace `ic-smoke`:
+
+```bash
+# List the pod names
+PODS=($(kubectl -n ic-smoke get pod -l app=vllm-engine -o jsonpath='{.items[*].metadata.name}'))
+
+# ZMQ port-forwards (15001, 15002, 15003)
+kubectl -n ic-smoke port-forward pod/${PODS[0]} 15001:5557 &
+kubectl -n ic-smoke port-forward pod/${PODS[1]} 15002:5557 &
+kubectl -n ic-smoke port-forward pod/${PODS[2]} 15003:5557 &
+
+# HTTP port-forwards (38010, 38011, 38012)
+kubectl -n ic-smoke port-forward pod/${PODS[0]} 38010:8000 &
+kubectl -n ic-smoke port-forward pod/${PODS[1]} 38011:8000 &
+kubectl -n ic-smoke port-forward pod/${PODS[2]} 38012:8000 &
+
+# Tell the harness about them
+export LOOKUP_PROXY_REPLICAS="r0:tcp://localhost:15001:http://localhost:38010,r1:tcp://localhost:15002:http://localhost:38011,r2:tcp://localhost:15003:http://localhost:38012"
+
+# Pick the tokenizer matching what the served model expects
+export LOOKUP_PROXY_TOKENIZER="hf-internal-testing/llama-tokenizer"
+```
+
+Then run normally:
+
+```bash
+./run_tuning_bench.sh run --scenario rag-headline --label test-bb --mode lookup
+```
+
+The proxy's per-request routing decisions are logged to `<results_dir>/lookup_proxy.log`. Each response also carries `X-Cache-Lookup-Reason` and `X-Cache-Route-Reason` headers for visibility.
+
+For runtime stats (chain table size per replica, hit/miss counters):
+
+```bash
+curl -s http://localhost:18100/proxy/metrics | jq
+```
+
+### Limitations
+
+- **Cold start is real**: the first few requests with a brand-new prefix will be NO_HINT until events propagate. Benchmarks should treat this as part of the warmup window.
+- **One LookupRoute per request**: ~50ms timeout. Failing open on timeout adds tail latency at p99. Tune `LOOKUP_TIMEOUT_S` in `lookup_proxy.py` if you need a different budget.
+- **Per-replica chain tables don't share state**: same token sequence on two replicas produces two different hashes (process-local). The proxy walks each replica separately and picks the longest hit; it doesn't try to merge across replicas.
+- **Memory**: each replica's chain table is bounded at 100k entries by LRU. At ~16 tokens/block, that's enough for ~1.6M tokens of cumulative prefix history per replica — usually adequate for benchmarks.
+
 ## Scenario YAML schema
 
 ```yaml
