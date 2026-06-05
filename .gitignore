@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local agent state — never commit these
+CLAUDE.md
+.claude/
+.mcp.json
+
+# Benchmark outputs (committed via .gitkeep stub)
+results/*
+!results/.gitkeep
+
+# Generated proto stubs (regenerate from inference-cache repo)
+proto/
+*.pb.go
+
+# Local secrets / kubeconfig overrides
+*.kubeconfig
+.env
+.env.local

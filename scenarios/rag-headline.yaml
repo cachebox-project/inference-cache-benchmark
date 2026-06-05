@@ -1,0 +1,44 @@
+name: rag-headline
+description: |
+  Launch-claim measurement — RAG-style workload with a 1500-token shared prefix
+  and a ~500-token unique suffix. This is the scenario for the headline
+  cache-win number.
+
+  Use this scenario when:
+    - Producing the headline TTFT-reduction figure
+    - Re-validating after major releases
+    - Reproducing a customer's reported TTFT issue (point --dataset-path at
+      their prompt sample)
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  tokenizer: meta-llama/Llama-3.1-8B-Instruct
+  # 2000 input tokens total, 200 output — D() is required for --prefix-ratio,
+  # also works fine with --prefix-len.
+  traffic_scenarios:
+    - "D(2000,200)"
+  prefix_len: 1500          # 75% prefix sharing across all requests
+  num_concurrency: [1, 4]   # both isolation (c=1) and headline (c=4)
+  max_requests_per_run: 200
+  max_time_per_run: 5       # minutes
+
+ic_metrics:
+  scrape_interval_s: 10
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_lookup_route_latency_seconds
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+    - inferencecache_policy_auth_total
+
+acceptance:
+  # Reference baseline for a vanilla Llama-3.1-8B on A100 is ~210 ms p50.
+  # Target ≥ 60% TTFT reduction (≤ 80 ms p50) on a cache-friendly workload.
+  ttft_p50_max_ms: 80
+  # 75% prefix sharing → expect ≥ 70% hit rate after warmup.
+  lookup_hit_rate_pct_min: 70
+  # Cold-path overhead of having the cache plane up should be < 5 ms p50
+  # (compared to baseline mode). The compare command handles this cross-run.
+  cold_path_overhead_max_ms: 5

@@ -1,0 +1,36 @@
+name: tuning-loop
+description: |
+  Fast, cheap measurement for iterating on CachePolicy / CacheBackend CRDs.
+  Short run (~2 min), single concurrency, single-scenario — gives a quick
+  signal to decide if a knob-turn helped.
+
+  Use this scenario when:
+    - You're iterating on `evictionTTL`, `minimumPrefixTokens`, `lookupTimeoutMs`
+    - You're comparing two CachePolicy versions
+    - You want a quick sanity check before re-running rag-headline
+
+  Don't use for headline claims — too short for statistically defensible
+  numbers. Use rag-headline.yaml for that.
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  tokenizer: meta-llama/Llama-3.1-8B-Instruct
+  traffic_scenarios:
+    - "D(1500,150)"
+  prefix_len: 1000
+  num_concurrency: [4]
+  max_requests_per_run: 80
+  max_time_per_run: 2        # short on purpose — tuning loop
+
+ic_metrics:
+  scrape_interval_s: 5       # tighter than rag-headline for short runs
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+
+acceptance:
+  # No strict targets — this is an iteration tool, not a gate.
+  # The compare command tells you whether the delta beat the noise floor.

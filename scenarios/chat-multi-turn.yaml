@@ -1,0 +1,37 @@
+name: chat-multi-turn
+description: |
+  Multi-turn chat workload — shorter shared prefix (system prompt only),
+  variable-length suffix (accumulating conversation). Tests a different cache
+  profile than RAG: smaller block_size win, stickier per-conversation routing.
+
+  Use this scenario when:
+    - Validating CachePolicy.minimumPrefixTokens defaults for chat workloads
+    - Comparing future canonical chat profile vs. RAG profile on the same model
+    - Reproducing customer chat-app TTFT issues
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  tokenizer: meta-llama/Llama-3.1-8B-Instruct
+  # Normal distribution: average 500-token input (system + 2-3 turns),
+  # 200-token output. Reflects realistic chat shape.
+  traffic_scenarios:
+    - "N(500,150)/(200,80)"
+  prefix_len: 200            # system prompt only, much shorter than RAG
+  num_concurrency: [4, 16]   # chat workloads tend to be more concurrent
+  max_requests_per_run: 300
+  max_time_per_run: 5
+
+ic_metrics:
+  scrape_interval_s: 10
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_lookup_route_latency_seconds
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+
+acceptance:
+  # Chat win is smaller — shorter shared prefix, less to skip
+  ttft_p50_max_ms: 140
+  lookup_hit_rate_pct_min: 50
