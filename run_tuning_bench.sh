@@ -35,8 +35,10 @@ PROTO_DIR="${INFERENCE_CACHE_PROTO_DIR:-$ROOT/proto}"
 : "${LOOKUP_PROXY_TOKENIZER:=hf-internal-testing/llama-tokenizer}"
 : "${WORKLOAD_NAMESPACE:=default}"
 # LOOKUP_PROXY_REPLICAS — comma-separated, one entry per replica.
-# Format: <id>:<zmq_endpoint>:<http_url>
-# Example: "r0:tcp://localhost:15001:http://localhost:38010,r1:tcp://localhost:15002:http://localhost:38011"
+# Within a replica, use "|" as the field separator (colons are ambiguous in URLs).
+# Format per replica: <id>|<zmq_endpoint>|<http_url>
+# Example:
+#   "r0|tcp://localhost:15001|http://localhost:38010,r1|tcp://localhost:15002|http://localhost:38011"
 : "${LOOKUP_PROXY_REPLICAS:=}"
 
 # -------- helpers --------

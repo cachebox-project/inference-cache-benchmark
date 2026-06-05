@@ -38,12 +38,12 @@ Usage
       --ic-server localhost:38002 \
       --default-upstream http://localhost:38000 \
       --tokenizer hf-internal-testing/llama-tokenizer \
-      --replica replica-0:tcp://localhost:15001:http://localhost:38010 \
-      --replica replica-1:tcp://localhost:15002:http://localhost:38011 \
-      --replica replica-2:tcp://localhost:15003:http://localhost:38012 \
+      --replica 'replica-0|tcp://localhost:15001|http://localhost:38010' \
+      --replica 'replica-1|tcp://localhost:15002|http://localhost:38011' \
+      --replica 'replica-2|tcp://localhost:15003|http://localhost:38012' \
       --log /tmp/lookup_proxy.log
 
-Each --replica arg is "<id>:<zmq_endpoint>:<http_upstream_url>". Port-forward
+Each --replica arg is "<id>|<zmq_endpoint>|<http_upstream_url>". Port-forward
 each replica's :5557 (ZMQ) and :8000 (HTTP) to local ports first.
 
 Requires the inference-cache proto stubs on sys.path
@@ -332,21 +332,23 @@ def _int_to_be8(h: int) -> bytes:
 
 
 def _parse_replica_spec(spec: str) -> Tuple[str, str, str]:
-    """Parse `id:zmq_endpoint:http_url`.
+    """Parse `id|zmq_endpoint|http_url`.
 
-    zmq_endpoint may contain `:` (tcp://host:port). We split from the right so
-    the URL keeps its scheme intact; then split from the left for the id.
+    Pipe is the separator because both URLs contain colons (`tcp://host:port`,
+    `http://host:port`), which makes a colon-separated tuple ambiguous. The id
+    cannot contain a pipe.
     """
-    head, _, http_url = spec.rpartition(":")
-    if not http_url or "://" not in http_url:
-        # Maybe http://... — try rpartition again to peel "host:port"
-        rest, _, port = head.rpartition(":")
-        http_url = f"{port}:{http_url}"
-        head = rest
-    rid, _, zmq_endpoint = head.partition(":")
-    if not rid or not zmq_endpoint or not http_url:
+    parts = spec.split("|")
+    if len(parts) != 3 or not all(parts):
         raise argparse.ArgumentTypeError(
-            f"--replica spec must be id:zmq_endpoint:http_url, got: {spec!r}"
+            f"--replica spec must be id|zmq_endpoint|http_url (three "
+            f"pipe-separated parts), got: {spec!r}"
+        )
+    rid, zmq_endpoint, http_url = parts
+    if "://" not in zmq_endpoint or "://" not in http_url:
+        raise argparse.ArgumentTypeError(
+            f"--replica spec parts 2 and 3 must be URLs with a scheme, got: "
+            f"zmq={zmq_endpoint!r} http={http_url!r}"
         )
     return rid, zmq_endpoint, http_url
 
@@ -419,8 +421,8 @@ def main() -> None:
         action="append",
         type=_parse_replica_spec,
         default=[],
-        help="Replica config: id:zmq_endpoint:http_url. Repeat for each replica. "
-             "Example: replica-0:tcp://localhost:15001:http://localhost:38010",
+        help="Replica config: id|zmq_endpoint|http_url. Repeat for each replica. "
+             "Example: 'replica-0|tcp://localhost:15001|http://localhost:38010'",
     )
     ap.add_argument("--hash-scheme", default=DEFAULT_HASH_SCHEME)
     ap.add_argument("--log", default=None)

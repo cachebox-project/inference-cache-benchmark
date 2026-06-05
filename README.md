@@ -187,7 +187,7 @@ kubectl -n ic-smoke port-forward pod/${PODS[1]} 38011:8000 &
 kubectl -n ic-smoke port-forward pod/${PODS[2]} 38012:8000 &
 
 # Tell the harness about them
-export LOOKUP_PROXY_REPLICAS="r0:tcp://localhost:15001:http://localhost:38010,r1:tcp://localhost:15002:http://localhost:38011,r2:tcp://localhost:15003:http://localhost:38012"
+export LOOKUP_PROXY_REPLICAS="r0|tcp://localhost:15001|http://localhost:38010,r1|tcp://localhost:15002|http://localhost:38011,r2|tcp://localhost:15003|http://localhost:38012"
 
 # Pick the tokenizer matching what the served model expects
 export LOOKUP_PROXY_TOKENIZER="hf-internal-testing/llama-tokenizer"
