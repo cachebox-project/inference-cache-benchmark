@@ -15,6 +15,7 @@ import csv
 import glob
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -42,6 +43,11 @@ def load_ic_metrics_csv(path: str) -> List[dict]:
         for r in reader:
             out = {}
             for k, v in r.items():
+                # DictReader uses key None for overflow fields when a row has
+                # more columns than the header. That can happen with older
+                # ic-metrics.csv files when a Prometheus label appears mid-run.
+                if k is None:
+                    continue
                 if v in (None, ""):
                     continue
                 try:
@@ -150,6 +156,135 @@ def compute_ttft_percentiles_from_genai_bench(gb: Optional[dict]) -> Dict[str, f
     return out
 
 
+# ------------------- full latency metrics (TTFT/TPOT/E2E/output) ----------
+#
+# genai-bench writes one JSON per (traffic_scenario, concurrency) run, named
+# like  <scenario>_<model>_concurrency_<N>_time_<T>s.json , with shape:
+#   {"aggregated_metrics": {... StatField per metric ...},
+#    "individual_request_metrics": [...]}
+# Each StatField carries: min/max/mean/stddev/sum/p25/p50/p75/p90/p95/p99.
+# We surface the four request-level latencies the comparison cares about,
+# broken out per concurrency level.
+
+# (display name, genai-bench field name)
+GB_METRICS = [
+    ("TTFT", "ttft"),
+    ("TPOT", "tpot"),
+    ("E2E latency", "e2e_latency"),
+    ("Output latency", "output_latency"),
+]
+GB_STATS = ["mean", "p50", "p90", "p95", "p99", "min", "max"]
+# genai-bench reports these latencies in SECONDS. We render ms. If a future
+# genai-bench version emits ms, flip this to False (sanity-check run #1 against
+# the genai-bench Excel — a 27B-INT4 TTFT should be hundreds of ms, not <1).
+GB_LATENCY_IS_SECONDS = True
+_CONC_RE = re.compile(r"_(?:concurrency|batch_size)_(\d+)_time_\d+s\.json$")
+
+
+def _find_statfield(node, metric: str):
+    """Recursively locate the StatField dict for `metric` anywhere under an
+    aggregated_metrics tree (robust to schema nesting across versions). A
+    StatField is recognised as a dict carrying at least a mean or p99 key."""
+    if isinstance(node, dict):
+        v = node.get(metric)
+        if isinstance(v, dict) and ("mean" in v or "p99" in v):
+            return v
+        for vv in node.values():
+            r = _find_statfield(vv, metric)
+            if r is not None:
+                return r
+    elif isinstance(node, list):
+        for vv in node:
+            r = _find_statfield(vv, metric)
+            if r is not None:
+                return r
+    return None
+
+
+def load_gb_runs(genai_bench_dir: str) -> Dict[int, Dict[str, dict]]:
+    """Return {concurrency: {field: {stat: float}}} from genai-bench per-run JSON."""
+    runs: Dict[int, Dict[str, dict]] = {}
+    if not os.path.isdir(genai_bench_dir):
+        return runs
+    for path in glob.glob(os.path.join(genai_bench_dir, "**", "*.json"), recursive=True):
+        m = _CONC_RE.search(os.path.basename(path))
+        if not m:
+            continue
+        conc = int(m.group(1))
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        agg = data.get("aggregated_metrics", data)
+        fields: Dict[str, dict] = {}
+        for _disp, key in GB_METRICS:
+            sf = _find_statfield(agg, key)
+            if sf:
+                fields[key] = {s: sf.get(s) for s in GB_STATS + ["p50"]}
+        if fields:
+            runs[conc] = fields
+    return runs
+
+
+def _fmt_lat(v) -> str:
+    if v is None:
+        return "—"
+    return f"{v * 1000:.1f}" if GB_LATENCY_IS_SECONDS else f"{v:.1f}"
+
+
+def render_latency_tables(genai_bench_dir: str) -> List[str]:
+    """Single-run: one table per concurrency, rows=metric, cols=stats (ms)."""
+    runs = load_gb_runs(genai_bench_dir)
+    out = ["## Latency metrics — genai-bench (ms)", ""]
+    if not runs:
+        out.append("_No genai-bench per-run JSON found — see `genai-bench/` for the raw Excel._")
+        out.append("")
+        return out
+    for conc in sorted(runs):
+        out.append(f"### Concurrency {conc}")
+        out.append("")
+        out.append("| Metric | " + " | ".join(s.upper() for s in GB_STATS) + " |")
+        out.append("|---|" + "---|" * len(GB_STATS))
+        for disp, key in GB_METRICS:
+            sf = runs[conc].get(key)
+            if not sf:
+                continue
+            out.append("| " + " | ".join([disp] + [_fmt_lat(sf.get(s)) for s in GB_STATS]) + " |")
+        out.append("")
+    return out
+
+
+def render_latency_comparison(rundirs: List[Tuple[str, str]]) -> List[str]:
+    """Compare: per concurrency, rows="<metric> <stat>", cols=labels + Δ (ms)."""
+    per_label = [(lab, load_gb_runs(os.path.join(d, "genai-bench"))) for lab, d in rundirs]
+    all_conc = sorted({c for _lab, runs in per_label for c in runs})
+    out = ["## Latency metrics — side by side (ms)", ""]
+    if not all_conc:
+        out.append("_No genai-bench per-run JSON found in any run dir._")
+        out.append("")
+        return out
+    multi = len(per_label) >= 2
+    for conc in all_conc:
+        out.append(f"### Concurrency {conc}")
+        out.append("")
+        hdr = ["Metric / stat"] + [lab for lab, _ in per_label] + (["Δ (last−first)"] if multi else [])
+        out.append("| " + " | ".join(hdr) + " |")
+        out.append("|" + "---|" * len(hdr))
+        for disp, key in GB_METRICS:
+            for stat in GB_STATS:
+                vals = [runs.get(conc, {}).get(key, {}).get(stat) for _lab, runs in per_label]
+                cells = [f"{disp} {stat.upper()}"] + [_fmt_lat(v) for v in vals]
+                if multi and vals[0] is not None and vals[-1] is not None:
+                    scale = 1000 if GB_LATENCY_IS_SECONDS else 1
+                    d = (vals[-1] - vals[0]) * scale
+                    pct = ((vals[-1] - vals[0]) / vals[0] * 100) if vals[0] else 0.0
+                    cells.append(f"{d:+.1f} ({pct:+.1f}%)")
+                out.append("| " + " | ".join(cells) + " |")
+        out.append("")
+    return out
+
+
 # ----------------------------- single-run report --------------------------
 
 
@@ -158,6 +293,15 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
     ic = load_ic_metrics_csv(os.path.join(rundir, "ic-metrics.csv"))
     gb = load_genai_bench_metrics(os.path.join(rundir, "genai-bench"))
     ttft = compute_ttft_percentiles_from_genai_bench(gb)
+    gb_runs = load_gb_runs(os.path.join(rundir, "genai-bench"))
+    # Robust TTFT p50 (ms) across concurrency levels — drives headline + gate
+    # when the legacy top-level-key heuristic above can't parse the JSON shape.
+    _scale = 1000 if GB_LATENCY_IS_SECONDS else 1
+    ttft_p50_ms = sorted(
+        r["ttft"]["p50"] * _scale
+        for r in gb_runs.values()
+        if r.get("ttft", {}).get("p50") is not None
+    )
     hit_rate = compute_hit_rate(ic)
     evictions = compute_eviction_delta(ic)
     index_peak = compute_index_peak(ic)
@@ -178,6 +322,9 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
     if ttft:
         for k in sorted(ttft):
             out.append(f"| genai-bench {k} | {ttft[k]:.2f} ms |")
+    elif ttft_p50_ms:
+        out.append(f"| TTFT p50 (best concurrency) | {ttft_p50_ms[0]:.1f} ms |")
+        out.append("| _full TTFT/TPOT/E2E/output breakdown_ | _see Latency metrics below_ |")
     else:
         out.append("| genai-bench TTFT | _not parsed — see `genai-bench/` for raw_ |")
     if hit_rate is not None:
@@ -187,6 +334,9 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
     if index_peak is not None:
         out.append(f"| Index entries peak | {index_peak:.0f} |")
     out.append("")
+
+    # Full latency breakdown (TTFT / TPOT / E2E / output) × stats, per concurrency
+    out.extend(render_latency_tables(os.path.join(rundir, "genai-bench")))
 
     # Acceptance gate
     accept = scenario.get("acceptance") or {}
@@ -200,7 +350,7 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
             t = accept["ttft_p50_max_ms"]
             # Find ANY parsed p50; pick the smallest (best concurrency)
             p50s = [v for k, v in ttft.items() if k.endswith("p50") or k.endswith("median")]
-            measured = min(p50s) if p50s else None
+            measured = min(p50s) if p50s else (ttft_p50_ms[0] if ttft_p50_ms else None)
             verdict = "—" if measured is None else ("✅ PASS" if measured <= t else "❌ FAIL")
             out.append(f"| TTFT p50 max | ≤ {t} ms | {measured if measured else 'n/a'} | {verdict} |")
         if "lookup_hit_rate_pct_min" in accept and hit_rate is not None:
@@ -287,6 +437,9 @@ def emit_comparison_report(results_dir: str, labels: List[str]) -> str:
             cells.append(f"{delta:+.1f} ({pct:+.1f}%)")
         out.append("| " + " | ".join(cells) + " |")
     out.append("")
+
+    # Full latency breakdown (TTFT / TPOT / E2E / output) × stats, per concurrency
+    out.extend(render_latency_comparison(rundirs))
 
     # CRD diff between A and B (first two only — multi-way diff is too noisy)
     if len(rundirs) >= 2:

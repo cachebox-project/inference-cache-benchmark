@@ -14,7 +14,9 @@ genai_bench:
   task: text-to-text
   api_backend: openai
   model: vllm-model
-  tokenizer: meta-llama/Llama-3.1-8B-Instruct
+  # Public Llama tokenizer for genai-bench prompt synthesis. The served model
+  # remains vllm-model; this avoids requiring a gated HF_TOKEN for validation.
+  tokenizer: hf-internal-testing/llama-tokenizer
   # 2000 input tokens total, 200 output — D() is required for --prefix-ratio,
   # also works fine with --prefix-len.
   traffic_scenarios:

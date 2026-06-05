@@ -94,14 +94,15 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    first = True
     fieldnames = ["ts"]
+    rows = []
     with open(args.output, "w", newline="") as f:
         writer: csv.DictWriter | None = None
         while not stop["flag"]:
             ts = time.time()
             sample = scrape_once(args.endpoint)
             row = {"ts": f"{ts:.3f}"}
+            added_field = False
             for (name, labels), value in sorted(sample.items()):
                 col = name
                 if labels:
@@ -109,22 +110,20 @@ def main():
                 row[col] = value
                 if col not in fieldnames:
                     fieldnames.append(col)
-            # On first iteration write the header; on subsequent, add new
-            # columns lazily (Prometheus may surface new label combos as the
-            # workload runs — e.g. a new reason_code value).
-            if first:
+                    added_field = True
+            rows.append(row)
+            # Prometheus may surface new label combinations as the workload
+            # runs. Rewrite the small scrape CSV when that happens so the
+            # header stays aligned with every row.
+            if writer is None or added_field:
+                f.seek(0)
+                f.truncate()
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                first = False
+                writer.writerows(rows)
             else:
-                # If new columns appeared, rewrite the file with the expanded header.
-                if writer is not None and writer.fieldnames != fieldnames:
-                    f.flush()
-                    # Cheap path: just write what we have; correlate.py can
-                    # tolerate sparse columns. Avoid the rewrite cost mid-run.
-                    pass
+                writer.writerow(row)
             assert writer is not None
-            writer.writerow(row)
             f.flush()
             # Sleep with early-exit support
             for _ in range(args.interval):

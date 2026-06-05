@@ -47,7 +47,7 @@ cmd_list_scenarios() {
   echo "Available scenarios in $SCENARIOS_DIR:"
   for f in "$SCENARIOS_DIR"/*.yaml; do
     name=$(basename "$f" .yaml)
-    desc=$(yq '.description // ""' "$f" | head -1)
+    desc=$(yq -r '.description // ""' "$f" | head -1)
     printf "  %-25s %s\n" "$name" "${desc:0:80}"
   done
 }
@@ -75,7 +75,7 @@ cmd_run() {
   local cfg="$SCENARIOS_DIR/$scenario.yaml"
   [[ -f "$cfg" ]] || die "scenario not found: $cfg"
 
-  local ts="$(printf '%(%Y%m%d-%H%M%S)T' -1)"
+  local ts="$(date +%Y%m%d-%H%M%S)"
   local outdir="$RESULTS_DIR/${label}-${ts}"
   mkdir -p "$outdir/genai-bench"
 
@@ -85,15 +85,15 @@ cmd_run() {
 
   # ---- parse scenario YAML ----
   local task model tokenizer max_req max_time
-  task=$(yq '.genai_bench.task' "$cfg")
-  model=$(yq '.genai_bench.model' "$cfg")
-  tokenizer=$(yq '.genai_bench.tokenizer // .genai_bench.model' "$cfg")
-  max_req=$(yq '.genai_bench.max_requests_per_run' "$cfg")
-  max_time=$(yq '.genai_bench.max_time_per_run' "$cfg")
-  local prefix_len; prefix_len=$(yq '.genai_bench.prefix_len // ""' "$cfg")
-  local scenarios; scenarios=$(yq '.genai_bench.traffic_scenarios[]' "$cfg")
-  local concurrencies; concurrencies=$(yq '.genai_bench.num_concurrency[]' "$cfg")
-  local scrape_interval; scrape_interval=$(yq '.ic_metrics.scrape_interval_s // 10' "$cfg")
+  task=$(yq -r '.genai_bench.task' "$cfg")
+  model=$(yq -r '.genai_bench.model' "$cfg")
+  tokenizer=$(yq -r '.genai_bench.tokenizer // .genai_bench.model' "$cfg")
+  max_req=$(yq -r '.genai_bench.max_requests_per_run' "$cfg")
+  max_time=$(yq -r '.genai_bench.max_time_per_run' "$cfg")
+  local prefix_len; prefix_len=$(yq -r '.genai_bench.prefix_len // ""' "$cfg")
+  local scenarios; scenarios=$(yq -r '.genai_bench.traffic_scenarios[]' "$cfg")
+  local concurrencies; concurrencies=$(yq -r '.genai_bench.num_concurrency[]' "$cfg")
+  local scrape_interval; scrape_interval=$(yq -r '.ic_metrics.scrape_interval_s // 10' "$cfg")
 
   # ---- snapshot CRDs (for the diff in `compare`) ----
   color_g "[2/6] Snapshotting CRDs from namespace $WORKLOAD_NAMESPACE"
@@ -173,7 +173,7 @@ cmd_run() {
 
 cmd_compare() {
   [[ $# -lt 2 ]] && die "usage: compare <label1> <label2> [<label3>]"
-  local out="$RESULTS_DIR/compare-$(IFS=-; echo "$*")-$(printf '%(%Y%m%d-%H%M%S)T' -1).md"
+  local out="$RESULTS_DIR/compare-$(IFS=-; echo "$*")-$(date +%Y%m%d-%H%M%S).md"
   python3 "$LIB_DIR/correlate.py" --compare --results-dir "$RESULTS_DIR" --labels "$@" > "$out"
   color_g "Comparison: $out"
   echo
