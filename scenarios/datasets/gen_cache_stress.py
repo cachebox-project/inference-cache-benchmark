@@ -46,9 +46,15 @@ import sys
 # Configuration.
 # ---------------------------------------------------------------------------
 
-NUM_PREFIXES = 50
-QUESTIONS_PER_PREFIX = 10
-WORDS_PER_PREFIX = 1100  # ≈ 1500 Llama tokens at ~1.4 tokens/word
+NUM_PREFIXES = 200
+QUESTIONS_PER_PREFIX = 5
+WORDS_PER_PREFIX = 5000  # ≈ 7000 Llama tokens at ~1.4 tokens/word
+# Total: 200 × 5 = 1000 prompts; ~7000 tokens each.
+# Working set: 200 × ~7000 = 1.4M prefix tokens.
+# This exceeds Llama-3.1-8B's per-replica KV budget at --max-model-len 8192
+# (~450K-token cache capacity) even when round-robined across 3 replicas
+# (1.4M / 3 ≈ 470K per replica), so vLLM's local prefix cache must evict —
+# putting load on the cache plane's offload tier and routing layer.
 
 # ---------------------------------------------------------------------------
 # Topical vocabulary — three pools so prefixes look domain-distinct.

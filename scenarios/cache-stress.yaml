@@ -46,8 +46,8 @@ genai_bench:
   # Pre-generated prompts file (paths are resolved relative to the harness root).
   dataset_path: scenarios/datasets/cache_stress.txt
   num_concurrency: [4]
-  max_requests_per_run: 500
-  max_time_per_run: 15        # minutes; cushion for the slower-by-design tail
+  max_requests_per_run: 1000   # 1000 prompts; long enough to see repeated prefixes after vLLM eviction
+  max_time_per_run: 25         # minutes; cushion for slower-by-design long-prompt tail
 
 ic_metrics:
   scrape_interval_s: 10
