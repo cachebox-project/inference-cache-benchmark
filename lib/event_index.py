@@ -47,7 +47,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 try:
     import msgspec
@@ -86,12 +86,15 @@ class AllBlocksCleared(_Event):
     pass
 
 
-_KVEvent = "BlockStored | BlockRemoved | AllBlocksCleared"
+# Typed union so msgspec dispatches each element to the right struct via its
+# tag. Without this typing the events come through as raw lists/tuples and
+# every isinstance() check downstream fails silently.
+_KVEvent = Union[BlockStored, BlockRemoved, AllBlocksCleared]
 
 
 class EventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
     ts: float = 0.0
-    events: list = []   # decoded as tagged-union of the three above
+    events: List[_KVEvent] = []
 
 
 _DECODER = msgspec.msgpack.Decoder(type=EventBatch)
