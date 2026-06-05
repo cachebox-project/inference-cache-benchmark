@@ -98,8 +98,10 @@ except ImportError as e:  # pragma: no cover
 # MUST match the engine's kvevent-subscriber `--hash-scheme` flag.
 DEFAULT_HASH_SCHEME = "vllm"
 
-# Server-side LookupRoute timeout — fail-open on overrun.
-LOOKUP_TIMEOUT_S = 0.05
+# Client-side LookupRoute timeout — fail-open on overrun. Must exceed
+# CachePolicy.lookupTimeoutMs + network RTT + serialization. Block-hash chains
+# of 80+ blocks take longer than the proxy old 50ms budget could allow.
+LOOKUP_TIMEOUT_S = 0.5
 
 
 class LookupProxy:
