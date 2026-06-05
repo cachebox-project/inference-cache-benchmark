@@ -42,22 +42,24 @@ This harness adds a thin layer that:
 ## Prerequisites
 
 ```bash
-pip install genai-bench grpcio aiohttp pandas pyyaml requests
+# 1. Python deps
+make install
+# (or: pip install genai-bench grpcio grpcio-tools aiohttp pandas pyyaml requests)
 ```
 
-Plus on the runner host: `kubectl`, `yq`, `jq`.
+Plus on the runner host: `kubectl`, `yq`, `jq`, `make`.
 
 You'll also need:
 
 1. **A Kubernetes cluster with inference-cache installed** and a running vLLM workload wired into a `CacheBackend`. See the [main repo's getting-started guide](https://github.com/cachebox-project/inference-cache) for setup.
-2. **Generated proto stubs** for inference-cache's gRPC API. From a checkout of the [main repo](https://github.com/cachebox-project/inference-cache):
+2. **Generated proto stubs** for inference-cache's gRPC API. From this directory, with the main [inference-cache](https://github.com/cachebox-project/inference-cache) repo checked out as a sibling:
    ```bash
-   mkdir -p ./proto
-   cd /path/to/inference-cache
-   python -m grpc_tools.protoc \
-     --python_out=$BENCH_DIR/proto \
-     --grpc_python_out=$BENCH_DIR/proto \
-     -Iproto proto/inferencecache/v1alpha1/inferencecache.proto
+   make proto
+   # → regenerates proto/ from ../inference-cache/proto/
+   ```
+   Override the source path if it lives elsewhere:
+   ```bash
+   make proto INFERENCE_CACHE_REPO=/abs/path/to/inference-cache
    ```
 3. **Port-forwards** to the inference-cache server (gRPC + metrics) and the vLLM engine (HTTP). The harness expects:
    ```bash
@@ -72,6 +74,11 @@ You'll also need:
    ```
 
    Override the defaults via env vars (`IC_SERVER_METRICS`, `IC_SERVER_GRPC`, `VLLM_ENGINE_URL`, `VLLM_BASELINE_URL`) — see `run_tuning_bench.sh` header.
+
+   Verify everything is reachable before a real run:
+   ```bash
+   make check-paths
+   ```
 
 ## Quick start
 
