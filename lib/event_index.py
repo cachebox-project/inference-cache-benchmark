@@ -225,6 +225,13 @@ class EventIndex:
         # to the local replica id used as a chain-table key. Empty by default;
         # registered via ``add_alias`` from the proxy spec.
         self.replica_aliases: Dict[str, str] = {}
+        # Round-robin counter used to break ties when multiple replicas have
+        # equal-length chains in ``find_best_chain``. Without this, dict
+        # iteration order (= --replica-alias arg order) wins every tie and
+        # the first-declared replica (typically r0) attracts ~99% of traffic
+        # whenever the longest chain is a trivial 1-block chat-template match
+        # — which is ~70% of requests in practice. See CAC-150.
+        self._tie_break_counter: int = 0
         self.stats = {
             "events_received": 0,
             "blocks_stored": 0,
@@ -234,6 +241,7 @@ class EventIndex:
             "decode_errors": 0,
             "root_reanchor_hits": 0,
             "replay_batches_received": 0,
+            "tie_break_count": 0,
         }
 
     def add_replica(self, replica_id: str, upstream_url: str) -> None:
@@ -268,10 +276,14 @@ class EventIndex:
         if bs <= 0 or len(token_ids) < bs:
             return None, [], []
 
-        best_rid: Optional[str] = None
-        best_hashes: List[int] = []
-        best_counts: List[int] = []
-        for rid, rep in self.replicas.items():
+        # Collect every replica's best chain so we can break ties deterministically
+        # across the full set. Sort replica ids before iterating: dict insertion
+        # order reflects argv order, and using it would mean the first-declared
+        # replica (typically r0) wins every tie. See CAC-150.
+        per_replica: List[Tuple[str, List[int], List[int]]] = []
+        max_len = 0
+        for rid in sorted(self.replicas.keys()):
+            rep = self.replicas[rid]
             hashes: List[int] = []
             counts: List[int] = []
             parent: Optional[int] = None
@@ -292,11 +304,22 @@ class EventIndex:
                 counts.append(bs)
                 parent = h
                 pos += bs
-            if len(hashes) > len(best_hashes):
-                best_rid, best_hashes, best_counts = rid, hashes, counts
-        if len(best_hashes) < min_blocks:
+            per_replica.append((rid, hashes, counts))
+            if len(hashes) > max_len:
+                max_len = len(hashes)
+
+        if max_len < min_blocks:
             return None, [], []
-        return best_rid, best_hashes, best_counts
+
+        tied = [entry for entry in per_replica if len(entry[1]) == max_len]
+        # Round-robin among the tied set so a 1-block chat-template match
+        # (tied across every replica) doesn't pin every request to one upstream.
+        picked = tied[self._tie_break_counter % len(tied)]
+        self._tie_break_counter += 1
+        self.stats["tie_break_count"] = self.stats.get("tie_break_count", 0) + (
+            1 if len(tied) > 1 else 0
+        )
+        return picked
 
     # ---- batch application — called by subscriber tasks --------------------
 

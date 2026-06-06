@@ -201,11 +201,25 @@ Then run normally:
 
 The proxy's per-request routing decisions are logged to `<results_dir>/lookup_proxy.log`. Each response also carries `X-Cache-Lookup-Reason` and `X-Cache-Route-Reason` headers for visibility.
 
+Each `route_decision` log line includes a `match_quality` field bucketed from the chain length the proxy walked:
+
+| Bucket | Chain blocks | Tokens (approx.) | Meaning |
+|---|---|---|---|
+| `trivial` | 1 | ~16 | chat-template framing only — every replica matches the same prefix; routing here is essentially round-robin |
+| `weak` | 2 – 7 | 32 – 112 | small shared prefix — modest hit |
+| `strong` | 8+ | 128+ | meaningful prefix reuse — the routing benefit lands here |
+
+Reading the log distribution by bucket tells you what fraction of `PREFIX_MATCH` responses actually drove routing benefit, without waiting for the server-side `PREFIX_MATCH_STRONG/WEAK` differentiation (CAC-149).
+
 For runtime stats (chain table size per replica, hit/miss counters):
 
 ```bash
 curl -s http://localhost:18100/proxy/metrics | jq
 ```
+
+A Prometheus text-format mirror lives at `/proxy/metrics.prom`; scrape that for the per-replica ZMQ event counter (`lookup_proxy_zmq_events_received_total{replica="r0"}`) — the load-bearing signal for silent-SUB outages. A replica stuck at 0 while siblings advance means its ZMQ PUB subscription isn't receiving events; long-chain matches for that replica will silently route elsewhere until the SUB recovers.
+
+The proxy also gates startup on this signal: it blocks the HTTP listener from binding until every configured replica has produced at least one event, or `--zmq-startup-timeout` (default 30s) elapses. On timeout it starts anyway and logs the silent replicas loudly; a background loop then re-establishes silent SUB sockets every `--zmq-retry-interval` (default 10s) — but only when at least one sibling replica is flowing (the all-silent state is "cluster idle", not a SUB bug).
 
 ### Limitations
 
