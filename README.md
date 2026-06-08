@@ -96,6 +96,9 @@ Produces `results/current-<timestamp>/`:
 - `ic-metrics.csv` — inference-cache metrics scraped every Ns
 - `report.md` — correlated comparison vs. acceptance criteria
 - `crd-snapshot.yaml` — CRDs at run time (so future `compare` runs can diff)
+- `scenario.yaml` — the scenario YAML used (verbatim copy)
+- `dataset.txt` — dataset fingerprint (path, SHA-256, line count, first-prompt
+  head, generator config) — only written when the scenario uses `dataset_path`
 
 ### The tuning loop
 
@@ -236,6 +239,56 @@ The proxy also gates startup on this signal: it blocks the HTTP listener from bi
 - **One LookupRoute per request**: ~50ms timeout. Failing open on timeout adds tail latency at p99. Tune `LOOKUP_TIMEOUT_S` in `lookup_proxy.py` if you need a different budget.
 - **Per-replica chain tables don't share state**: same token sequence on two replicas produces two different hashes (process-local). The proxy walks each replica separately and picks the longest hit; it doesn't try to merge across replicas.
 - **Memory**: each replica's chain table is bounded at 100k entries by LRU. At ~16 tokens/block, that's enough for ~1.6M tokens of cumulative prefix history per replica — usually adequate for benchmarks.
+
+## Reproducing a historical run
+
+Every run that uses a `dataset_path` scenario gets a `dataset.txt` in its
+result dir capturing exactly which dataset bytes were used. To re-run a
+historical comparison from scratch:
+
+1. **Read `results/<label>-<ts>/dataset.txt`.** It lists the dataset's
+   SHA-256, line count, and the `generator_config:` block (`num_prefixes`,
+   `questions_per_prefix`, `words_per_prefix`, RNG seeds).
+2. **Regenerate the dataset** with those exact knobs:
+   ```bash
+   python scenarios/datasets/gen_cache_stress.py \
+     --num-prefixes 600 \
+     --questions-per-prefix 5 \
+     --words-per-prefix 5000
+   ```
+   Generators are seeded, so the output is byte-identical across runs with
+   the same args. Confirm by re-hashing:
+   ```bash
+   shasum -a 256 scenarios/datasets/cache_stress.txt
+   # → must match the sha256: field in dataset.txt
+   ```
+3. **Re-run the harness** with the same scenario and the rest of the harness
+   config (CRDs, replicas, etc.) restored to what `crd-snapshot.yaml` records.
+
+If a result dir is missing `dataset.txt` it predates CAC-159; use
+`tools/backfill_dataset_meta.sh` to write the fingerprint based on the
+**current** dataset (the script flags this with a `NOTE:` line since the
+on-disk dataset may differ from what the run actually used).
+
+### Generator knobs (cache_stress)
+
+| CLI flag | Default | Meaning |
+|---|---|---|
+| `--num-prefixes` | 600 | Distinct prefix blocks |
+| `--questions-per-prefix` | 5 | Questions appended per prefix (capped at 10) |
+| `--words-per-prefix` | 5000 | ≈ 1.4× tokens for Llama tokenizer |
+| `--prefix-seed` | `cache_stress_prefix` | Per-block RNG seed prefix |
+| `--shuffle-seed` | `cache_stress_shuffle` | Final shuffle seed |
+| `--output` | `scenarios/datasets/cache_stress.txt` | Output path |
+
+The generator also writes `<output>.meta.yaml` alongside the dataset; the
+harness embeds this in each run's `dataset.txt` so the knobs travel with the
+result.
+
+Historical sizings used in Phase 2 (recorded in CAC-159 for context):
+- `600 × 5 × 5000` — current default, CAC-139 forced-eviction sizing (~100 MB, 3.3M prefix tokens)
+- `200 × 5 × 5000` — reverted 5-iter rerun sizing (~34 MB, 1.4M prefix tokens)
+- `50 × 10 × 1100` — original phase-1 sizing (~3 MB, 75K prefix tokens)
 
 ## Scenario YAML schema
 
