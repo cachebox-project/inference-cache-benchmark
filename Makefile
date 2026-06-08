@@ -3,7 +3,7 @@
 # Common entry points so you don't have to remember the exact protoc invocation
 # or which port-forwards the run script expects.
 
-.PHONY: help proto install lint smoke clean check-paths datasets
+.PHONY: help proto install lint smoke test clean check-paths datasets
 
 # Where the main inference-cache repo lives. Override on the command line:
 #   make proto INFERENCE_CACHE_REPO=/path/to/inference-cache
@@ -16,6 +16,7 @@ help:
 	@echo "make datasets           Generate scenario datasets that need precomputed prompts"
 	@echo "make lint               Lint shell + python sources"
 	@echo "make smoke              List available scenarios (sanity check)"
+	@echo "make test               Run the proxy/event-index pytest suite"
 	@echo "make check-paths        Verify port-forwards and proto stubs before a real run"
 	@echo "make clean              Remove proto/, results/*/, __pycache__"
 	@echo ""
@@ -58,12 +59,22 @@ install:
 	  'grpcio>=1.60' grpcio-tools \
 	  aiohttp pandas pyyaml requests \
 	  pyzmq 'msgspec>=0.18' \
-	  transformers sentencepiece
+	  transformers sentencepiece \
+	  pytest pytest-asyncio
 
 # ---- lint ----
 lint:
 	@command -v shellcheck >/dev/null && shellcheck run_tuning_bench.sh || echo "(shellcheck missing — skipping shell lint)"
 	@python3 -m py_compile lib/*.py && echo "✓ python compile-checks pass"
+	@python3 -m py_compile tests/*.py && echo "✓ test compile-checks pass"
+
+# ---- test: pytest suite for lookup_proxy / event_index ----
+# Uses pytest-asyncio; pyproject.toml sets `asyncio_mode = "auto"`. The
+# conftest shims the inference-cache gRPC stubs so tests run without
+# needing `make proto` first.
+test:
+	@command -v python3 >/dev/null || { echo "ERROR: python3 missing"; exit 1; }
+	python3 -m pytest tests/ -v
 
 # ---- smoke: list-scenarios should just work ----
 smoke:
@@ -99,4 +110,5 @@ clean:
 	rm -rf $(PROTO_OUT)
 	find results -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
 	find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
-	@echo "✓ Cleaned proto/, results/*/, __pycache__/"
+	rm -rf .pytest_cache tests/__pycache__
+	@echo "✓ Cleaned proto/, results/*/, __pycache__/, .pytest_cache/"

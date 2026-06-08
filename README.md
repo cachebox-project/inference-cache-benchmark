@@ -155,9 +155,18 @@ walk each replica's chain → find longest leading match across all replicas
 send LookupRoute with that replica's exact block_hashes + token_counts chain
     ↓
 PREFIX_MATCH → route to hinted replica's HTTP URL
-NO_HINT / TIMEOUT / NO_CHAIN_OBSERVED → round-robin among known replicas
-                                       (falls back to --default-upstream if none)
+NO_HINT / TIMEOUT / NO_CHAIN_OBSERVED → round-robin across --replicas pool
 ```
+
+**`--replicas` (CAC-154)**: the round-robin fallback pool — a list of
+upstream URLs, comma-separated or repeated. Models the production
+dumb-gateway behavior: when the server returns no usable hint, traffic
+spreads evenly across all known replicas instead of concentrating on one
+pod. Replaces the old `--default-upstream` (which sent every NO_HINT
+response to a single target, hammering r0 in the typical layout). The
+proxy keeps a per-process round-robin pointer so picks are deterministic
+and a 30-request NO_HINT burst against 3 URLs produces a clean 10/10/10
+split.
 
 **Cold-start behavior**: until the proxy has seen events for a prefix, that prefix gets NO_HINT and is routed round-robin. After ~5-10 requests with a shared prefix, the chain table populates and subsequent requests get PREFIX_MATCH. This is exactly how a real gateway integration would behave — and what benchmarks measure during their warmup + steady-state windows.
 
@@ -201,11 +210,25 @@ Then run normally:
 
 The proxy's per-request routing decisions are logged to `<results_dir>/lookup_proxy.log`. Each response also carries `X-Cache-Lookup-Reason` and `X-Cache-Route-Reason` headers for visibility.
 
+Each `route_decision` log line includes a `match_quality` field bucketed from the chain length the proxy walked:
+
+| Bucket | Chain blocks | Tokens (approx.) | Meaning |
+|---|---|---|---|
+| `trivial` | 1 | ~16 | chat-template framing only — every replica matches the same prefix; routing here is essentially round-robin |
+| `weak` | 2 – 7 | 32 – 112 | small shared prefix — modest hit |
+| `strong` | 8+ | 128+ | meaningful prefix reuse — the routing benefit lands here |
+
+Reading the log distribution by bucket tells you what fraction of `PREFIX_MATCH` responses actually drove routing benefit, without waiting for the server-side `PREFIX_MATCH_STRONG/WEAK` differentiation (CAC-149).
+
 For runtime stats (chain table size per replica, hit/miss counters):
 
 ```bash
 curl -s http://localhost:18100/proxy/metrics | jq
 ```
+
+A Prometheus text-format mirror lives at `/proxy/metrics.prom`; scrape that for the per-replica ZMQ event counter (`lookup_proxy_zmq_events_received_total{replica="r0"}`) — the load-bearing signal for silent-SUB outages. A replica stuck at 0 while siblings advance means its ZMQ PUB subscription isn't receiving events; long-chain matches for that replica will silently route elsewhere until the SUB recovers.
+
+The proxy also gates startup on this signal: it blocks the HTTP listener from binding until every configured replica has produced at least one event, or `--zmq-startup-timeout` (default 30s) elapses. On timeout it starts anyway and logs the silent replicas loudly; a background loop then re-establishes silent SUB sockets every `--zmq-retry-interval` (default 10s) — but only when at least one sibling replica is flowing (the all-silent state is "cluster idle", not a SUB bug).
 
 ### Limitations
 
