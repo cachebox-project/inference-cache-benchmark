@@ -126,17 +126,34 @@ Generate it first (see the scenario's description for the generator command)."
     no-hint)  target_url="$VLLM_ENGINE_URL"   ;;
     lookup)
       color_g "[3/6] Starting LookupRoute proxy on :$LOOKUP_PROXY_PORT"
-      # Build --replica args from LOOKUP_PROXY_REPLICAS env var (comma-separated)
+      # Build --replica args (ZMQ subscription specs) AND the --replicas fallback
+      # URL list from LOOKUP_PROXY_REPLICAS. Each spec is
+      # `id|zmq_sub|http_url[|zmq_router]`; we hand the http_url field of each
+      # to --replicas so the proxy round-robins fallback traffic across all
+      # known pods instead of concentrating on one (CAC-154).
       local -a replica_args=()
+      local -a fallback_urls=()
       if [[ -n "$LOOKUP_PROXY_REPLICAS" ]]; then
         IFS=',' read -ra _reps <<< "$LOOKUP_PROXY_REPLICAS"
         for r in "${_reps[@]}"; do
           replica_args+=("--replica" "$r")
+          # third pipe-separated field is the http upstream URL
+          local _http_url; _http_url=$(awk -F'|' '{print $3}' <<< "$r")
+          [[ -n "$_http_url" ]] && fallback_urls+=("$_http_url")
         done
       else
         color_y "  WARNING: LOOKUP_PROXY_REPLICAS not set. The proxy will subscribe"
         color_y "  to zero replicas, observe no events, and return NO_HINT on every"
         color_y "  request — degenerating to no-hint mode. See README §B-b setup."
+      fi
+      # Fallback pool: prefer the per-replica http URLs derived above; fall
+      # back to $VLLM_ENGINE_URL as a single-element list for backward compat
+      # if the env var was unset.
+      local replicas_csv
+      if (( ${#fallback_urls[@]} > 0 )); then
+        replicas_csv=$(IFS=','; echo "${fallback_urls[*]}")
+      else
+        replicas_csv="$VLLM_ENGINE_URL"
       fi
       # LOOKUP_PROXY_EXTRA_ARGS: free-form extra args appended to the proxy
       # invocation. Useful for --replica-alias or any future flag. Word-split.
@@ -148,7 +165,7 @@ Generate it first (see the scenario's description for the generator command)."
       PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$LIB_DIR/lookup_proxy.py" \
         --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \
         --ic-server "$IC_SERVER_GRPC" \
-        --default-upstream "$VLLM_ENGINE_URL" \
+        --replicas "$replicas_csv" \
         --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
         --tenant "${LOOKUP_PROXY_TENANT:-$WORKLOAD_NAMESPACE}" \
         "${replica_args[@]}" \

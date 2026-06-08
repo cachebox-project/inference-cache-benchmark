@@ -36,7 +36,7 @@ Usage
     python3 lookup_proxy.py \
       --listen 0.0.0.0:18100 \
       --ic-server localhost:38002 \
-      --default-upstream http://localhost:38000 \
+      --replicas http://localhost:38010,http://localhost:38011,http://localhost:38012 \
       --tokenizer hf-internal-testing/llama-tokenizer \
       --replica 'replica-0|tcp://localhost:15001|http://localhost:38010' \
       --replica 'replica-1|tcp://localhost:15002|http://localhost:38011' \
@@ -45,6 +45,12 @@ Usage
 
 Each --replica arg is "<id>|<zmq_endpoint>|<http_upstream_url>". Port-forward
 each replica's :5557 (ZMQ) and :8000 (HTTP) to local ports first.
+
+``--replicas`` (CAC-154) is the round-robin fallback pool used on
+NO_HINT / TIMEOUT / PREFIX_MATCH-for-unknown-replica. It models the
+production dumb-gateway behavior: when the server gives no usable hint,
+spread traffic evenly across all known replica HTTP URLs rather than
+hammering a single pod.
 
 Requires the inference-cache proto stubs on sys.path
 (PYTHONPATH=$INFERENCE_CACHE_PROTO_DIR).
@@ -108,7 +114,7 @@ class LookupProxy:
     def __init__(
         self,
         ic_server: str,
-        default_upstream: str,
+        replicas: List[str],
         tokenizer_name: str,
         hash_scheme: str,
         event_index: EventIndex,
@@ -116,7 +122,11 @@ class LookupProxy:
         zmq_startup_timeout_s: float = 30.0,
     ):
         self.ic_server = ic_server
-        self.default_upstream = default_upstream.rstrip("/")
+        if not replicas:
+            raise ValueError(
+                "replicas must be a non-empty list of upstream URLs (CAC-154)"
+            )
+        self.replicas: List[str] = [u.rstrip("/") for u in replicas]
         self.hash_scheme = hash_scheme
         self.event_index = event_index
         # Must match the tenant the engine's kvevent-subscriber sidecar sends
@@ -146,7 +156,6 @@ class LookupProxy:
             "lookup_errors": 0,
             "lookup_skipped_no_chain": 0,
             "routed_to_hint": 0,
-            "routed_to_default": 0,
             "routed_round_robin_fallback": 0,
             "lookup_latency_us_sum": 0.0,
             "match_quality_trivial": 0,
@@ -267,9 +276,12 @@ class LookupProxy:
           1. Hint matches a known replica id directly → use that upstream
           2. Hint matches a registered alias → use the aliased replica's upstream
           3. Hint set but no match → round-robin (so the request still lands
-             on SOME warm replica, even if not the one the server picked)
-          4. No hint → round-robin among known replicas if available
-          5. No known replicas → default_upstream
+             on SOME known replica, even if not the one the server picked)
+          4. No hint → round-robin across ``self.replicas``
+
+        CAC-154: there is no single "default upstream" anymore — fallback ALWAYS
+        round-robins across the configured ``--replicas`` pool so NO_HINT and
+        TIMEOUT responses can't concentrate traffic on one pod.
         """
         if hint_replica_id is not None:
             rep = self.event_index.replicas.get(hint_replica_id)
@@ -281,14 +293,10 @@ class LookupProxy:
             if rep is not None:
                 self.stats["routed_to_hint"] += 1
                 return rep.upstream_url, "HINT"
-        if self.event_index.replicas:
-            replicas = list(self.event_index.replicas.values())
-            chosen = replicas[self._rr_counter % len(replicas)]
-            self._rr_counter += 1
-            self.stats["routed_round_robin_fallback"] += 1
-            return chosen.upstream_url, "ROUND_ROBIN"
-        self.stats["routed_to_default"] += 1
-        return self.default_upstream, "DEFAULT"
+        chosen = self.replicas[self._rr_counter % len(self.replicas)]
+        self._rr_counter += 1
+        self.stats["routed_round_robin_fallback"] += 1
+        return chosen, "ROUND_ROBIN"
 
     # ---- HTTP handlers ----------------------------------------------------
 
@@ -600,7 +608,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     proxy = LookupProxy(
         ic_server=args.ic_server,
-        default_upstream=args.default_upstream,
+        replicas=args.replicas,
         tokenizer_name=args.tokenizer,
         hash_scheme=args.hash_scheme,
         event_index=index,
@@ -668,9 +676,9 @@ async def main_async(args: argparse.Namespace) -> None:
     site = web.TCPSite(runner, host, int(port))
     await site.start()
     logging.info(
-        "lookup_proxy listening on %s; ic_server=%s; default_upstream=%s; "
-        "hash_scheme=%s; replicas=%d",
-        args.listen, args.ic_server, args.default_upstream,
+        "lookup_proxy listening on %s; ic_server=%s; replicas=%s; "
+        "hash_scheme=%s; subscriptions=%d",
+        args.listen, args.ic_server, proxy.replicas,
         args.hash_scheme, len(args.replica),
     )
 
@@ -689,10 +697,18 @@ def main() -> None:
     ap.add_argument("--listen", default="0.0.0.0:18100")
     ap.add_argument("--ic-server", required=True,
                     help="inference-cache-server gRPC endpoint, e.g. localhost:38002")
-    ap.add_argument("--default-upstream", required=True,
-                    help="vLLM fallback URL when no hint / no replicas")
-    ap.add_argument("--upstream", default=None,
-                    help="DEPRECATED alias for --default-upstream")
+    ap.add_argument(
+        "--replicas",
+        action="append",
+        default=[],
+        help="Round-robin fallback pool used on NO_HINT / TIMEOUT / "
+             "PREFIX_MATCH for an unknown replica (CAC-154). Comma-separated "
+             "URLs OR repeat the flag. Example: "
+             "'--replicas http://r0:38010,http://r1:38011,http://r2:38012' or "
+             "'--replicas http://r0:38010 --replicas http://r1:38011 --replicas http://r2:38012'. "
+             "Replaces the old single-pod --default-upstream — production "
+             "gateways spread fallback traffic instead of concentrating it.",
+    )
     ap.add_argument("--tokenizer", required=True,
                     help="HF tokenizer id, e.g. hf-internal-testing/llama-tokenizer")
     ap.add_argument(
@@ -749,15 +765,28 @@ def main() -> None:
     ap.add_argument("--log", default=None)
     args = ap.parse_args()
 
-    if args.upstream and not args.default_upstream:
-        args.default_upstream = args.upstream
+    # --replicas accepts both repeated flags and comma-separated values per
+    # flag, so flatten before handing off.
+    flat: List[str] = []
+    for entry in args.replicas:
+        for url in entry.split(","):
+            url = url.strip()
+            if url:
+                flat.append(url)
+    args.replicas = flat
+    if not args.replicas:
+        ap.error(
+            "--replicas is required: pass at least one upstream URL "
+            "(comma-separated or repeated). Replaces the old --default-upstream "
+            "single-pod fallback (CAC-154)."
+        )
 
     if not args.replica:
         sys.stderr.write(
             "WARNING: no --replica specified. Without per-replica ZMQ subscriptions, "
             "the proxy cannot observe block hashes, so LookupRoute will always return "
-            "NO_HINT and every request will route to --default-upstream. This is the "
-            "broken behavior CAC-135 fixes; pass --replica args to enable it.\n"
+            "NO_HINT and every request will round-robin across --replicas. "
+            "Pass --replica args to enable hint-driven routing.\n"
         )
 
     try:

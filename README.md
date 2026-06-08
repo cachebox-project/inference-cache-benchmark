@@ -155,9 +155,18 @@ walk each replica's chain → find longest leading match across all replicas
 send LookupRoute with that replica's exact block_hashes + token_counts chain
     ↓
 PREFIX_MATCH → route to hinted replica's HTTP URL
-NO_HINT / TIMEOUT / NO_CHAIN_OBSERVED → round-robin among known replicas
-                                       (falls back to --default-upstream if none)
+NO_HINT / TIMEOUT / NO_CHAIN_OBSERVED → round-robin across --replicas pool
 ```
+
+**`--replicas` (CAC-154)**: the round-robin fallback pool — a list of
+upstream URLs, comma-separated or repeated. Models the production
+dumb-gateway behavior: when the server returns no usable hint, traffic
+spreads evenly across all known replicas instead of concentrating on one
+pod. Replaces the old `--default-upstream` (which sent every NO_HINT
+response to a single target, hammering r0 in the typical layout). The
+proxy keeps a per-process round-robin pointer so picks are deterministic
+and a 30-request NO_HINT burst against 3 URLs produces a clean 10/10/10
+split.
 
 **Cold-start behavior**: until the proxy has seen events for a prefix, that prefix gets NO_HINT and is routed round-robin. After ~5-10 requests with a shared prefix, the chain table populates and subsequent requests get PREFIX_MATCH. This is exactly how a real gateway integration would behave — and what benchmarks measure during their warmup + steady-state windows.
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from typing import Dict, List, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -233,7 +234,7 @@ async def test_handle_metrics_prom_exposes_per_replica_counter():
                return_value=MagicMock(__len__=lambda self: 0)):
         proxy = LookupProxy(
             ic_server="ignored:0",
-            default_upstream="http://default",
+            replicas=["http://up-r0", "http://up-r1", "http://up-r2"],
             tokenizer_name="any",
             hash_scheme="vllm",
             event_index=index,
@@ -248,3 +249,99 @@ async def test_handle_metrics_prom_exposes_per_replica_counter():
     assert 'lookup_proxy_zmq_events_received_total{replica="r2"} 2' in body
     assert 'lookup_proxy_chain_entries{replica="r0"} 2' in body
     assert 'lookup_proxy_ready 0' in body  # not ready yet
+
+
+# ---- CAC-154: round-robin fallback on NO_HINT / TIMEOUT ---------------------
+
+
+def _build_proxy(replicas):
+    """Construct a LookupProxy without doing the heavy tokenizer load."""
+    index = EventIndex()
+    with patch("lookup_proxy.AutoTokenizer.from_pretrained",
+               return_value=MagicMock(__len__=lambda self: 0)):
+        return LookupProxy(
+            ic_server="ignored:0",
+            replicas=replicas,
+            tokenizer_name="any",
+            hash_scheme="vllm",
+            event_index=index,
+            tenant="t",
+        )
+
+
+def test_no_hint_fallback_round_robins_across_replicas():
+    """30 NO_HINT picks → ~10/10/10 distribution, not 30/0/0.
+
+    Reproduces CAC-154's bug: the old --default-upstream pointed at a single
+    pod, so every NO_HINT/TIMEOUT response concentrated on r0. The fix
+    replaces it with --replicas (plural) and a round-robin pointer.
+    """
+    urls = [
+        "http://r0.local:38010",
+        "http://r1.local:38011",
+        "http://r2.local:38012",
+    ]
+    proxy = _build_proxy(urls)
+
+    counts = Counter()
+    reasons = Counter()
+    for _ in range(30):
+        upstream, reason = proxy._pick_upstream(hint_replica_id=None)
+        counts[upstream] += 1
+        reasons[reason] += 1
+
+    # Strict equality is achievable because 30 is a multiple of 3 and the
+    # pointer is deterministic.
+    assert counts == Counter({url: 10 for url in urls}), counts
+    assert reasons == Counter({"ROUND_ROBIN": 30}), reasons
+    assert proxy.stats["routed_round_robin_fallback"] == 30
+    assert proxy.stats["routed_to_hint"] == 0
+
+
+def test_pick_upstream_prefers_hint_when_replica_id_matches_event_index():
+    """A valid hint short-circuits round-robin and routes to the named replica."""
+    urls = [
+        "http://r0.local:38010",
+        "http://r1.local:38011",
+        "http://r2.local:38012",
+    ]
+    proxy = _build_proxy(urls)
+    proxy.event_index.add_replica("r1", "http://r1.local:38011")
+
+    upstream, reason = proxy._pick_upstream(hint_replica_id="r1")
+    assert reason == "HINT"
+    assert upstream == "http://r1.local:38011"
+    assert proxy.stats["routed_to_hint"] == 1
+    assert proxy.stats["routed_round_robin_fallback"] == 0
+
+
+def test_pick_upstream_falls_back_to_round_robin_when_hint_is_unknown():
+    """An unparseable / unknown hint should still spread, not pin to r0."""
+    urls = [
+        "http://r0.local:38010",
+        "http://r1.local:38011",
+        "http://r2.local:38012",
+    ]
+    proxy = _build_proxy(urls)
+    proxy.event_index.add_replica("r1", "http://r1.local:38011")
+
+    counts = Counter()
+    for _ in range(30):
+        upstream, reason = proxy._pick_upstream(hint_replica_id="not-a-real-pod")
+        assert reason == "ROUND_ROBIN"
+        counts[upstream] += 1
+    assert counts == Counter({url: 10 for url in urls}), counts
+
+
+def test_lookup_proxy_rejects_empty_replicas():
+    with patch("lookup_proxy.AutoTokenizer.from_pretrained",
+               return_value=MagicMock(__len__=lambda self: 0)):
+        with pytest.raises(ValueError, match="non-empty"):
+            LookupProxy(
+                ic_server="ignored:0",
+                replicas=[],
+                tokenizer_name="any",
+                hash_scheme="vllm",
+                event_index=EventIndex(),
+                tenant="t",
+            )
