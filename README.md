@@ -64,15 +64,18 @@ You'll also need:
    ```bash
    make proto INFERENCE_CACHE_REPO=/abs/path/to/inference-cache
    ```
-3. **Port-forwards** to the inference-cache server (gRPC + metrics) and the vLLM engine (HTTP). The harness expects:
+3. **Port-forwards.** The harness needs reachability to the inference-cache server and to vLLM. **Read the gotcha below before choosing PF targets.**
+
+   For the inference-cache server (single replica — `svc/...` is fine):
    ```bash
-   # In the namespace where inference-cache is installed:
    kubectl -n inference-cache port-forward svc/inference-cache-server 38001:8080 &  # /metrics
    kubectl -n inference-cache port-forward svc/inference-cache-server 38002:9090 &  # gRPC
+   ```
 
-   # In the workload namespace:
-   kubectl -n <workload-ns> port-forward svc/<vllm-engine-svc> 38000:8000 &
-   # For baseline-mode measurements (vanilla vLLM, no cache plane):
+   For vLLM, **always use per-pod port-forwards** when the deployment has more than one replica — see the [`lookup` mode setup](#setting-up-lookup-mode) below. That covers `--mode lookup` and `--mode no-hint` (the proxy round-robins fallback traffic across all pods).
+
+   For `--mode baseline` against a **single-replica** vanilla vLLM, `svc/...` is acceptable:
+   ```bash
    kubectl -n <baseline-ns> port-forward svc/<vanilla-vllm-svc> 38005:8000 &
    ```
 
@@ -82,6 +85,24 @@ You'll also need:
    ```bash
    make check-paths
    ```
+
+> ⚠️ **`kubectl port-forward svc/<name>` does NOT load-balance.** The apiserver
+> picks one endpoint at PF-establish time and pins every connection on that
+> port to that endpoint until the PF dies. Across multiple PF sessions over
+> 36 h on the `ic-smoke` deployment (CAC-163), one pod accumulated 0 requests
+> while siblings served millions — the kube-proxy/iptables layer was fine; the
+> imbalance came entirely from PF pinning. **Any measurement that depends on
+> traffic spreading across replicas (cache distribution, per-pod hit rate,
+> replica-balance studies) must use per-pod PFs through `lookup_proxy.py`'s
+> explicit round-robin** (`LOOKUP_PROXY_REPLICAS`, set up in the [lookup-mode
+> section](#setting-up-lookup-mode) below). Use `svc/...` PF only for
+> single-replica targets, or for local connectivity smoke tests where you
+> don't care which pod answers.
+>
+> The harness includes an automatic post-run check (`lib/check_pod_distribution.py`)
+> that scrapes per-pod `vllm:prefix_cache_queries_total` before and after the
+> run and warns loudly if any pod received zero traffic while siblings got
+> some — pointing at exactly this misconfiguration.
 
 ### Keeping port-forwards alive across long sessions
 
@@ -259,7 +280,9 @@ You need port-forwards to TWO endpoints per replica:
 | Per-replica need | What it's for |
 |---|---|
 | **ZMQ event port** (`:5557` on the pod) | Subscriber listens; vLLM publishes here |
-| **HTTP serve port** (`:8000` on the pod) | Where the proxy forwards requests when it has a hint |
+| **HTTP serve port** (`:8000` on the pod) | Where the proxy forwards requests (PREFIX_MATCH or round-robin fallback) |
+
+Note: `--mode no-hint` also benefits from this setup — when `LOOKUP_PROXY_REPLICAS` is configured, the proxy round-robins fallback traffic across all known pod URLs. Pointing `--mode no-hint` straight at `kubectl port-forward svc/<vllm-engine>` instead would pin every request to a single pod (see callout in Prerequisites).
 
 For a 3-replica deployment in namespace `ic-smoke`:
 
