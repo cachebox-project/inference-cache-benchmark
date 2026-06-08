@@ -120,6 +120,7 @@ class LookupProxy:
         event_index: EventIndex,
         tenant: str = "default",
         zmq_startup_timeout_s: float = 30.0,
+        no_lookup_route: bool = False,
     ):
         self.ic_server = ic_server
         if not replicas:
@@ -134,6 +135,15 @@ class LookupProxy:
         # engine pod's namespace via $(POD_NAMESPACE)).
         self.tenant = tenant
         self.zmq_startup_timeout_s = zmq_startup_timeout_s
+        # When set, the proxy skips the LookupRoute RPC, the ZMQ subscriptions,
+        # and the tokenizer load entirely. Every request round-robins across
+        # the configured ``--replicas`` pool. This is the "cache plane up,
+        # routing layer disabled" measurement used by the benchmark harness's
+        # no-hint mode (CAC-153) — it isolates the LMCache wrapper's overhead
+        # from any LookupRoute-driven routing benefit. Without this flag, the
+        # harness's no-hint mode pointed genai-bench at a single VLLM_ENGINE_URL
+        # and collapsed to a 1-pod measurement.
+        self.no_lookup_route = no_lookup_route
         # Signalled by ``await_zmq_ready`` once every replica has produced at
         # least one decoded ZMQ event (or the startup timeout has elapsed).
         # Until then, the HTTP site doesn't bind — see ``main_async``.
@@ -142,9 +152,13 @@ class LookupProxy:
         self._stub: Optional[pb_grpc.InferenceCacheStub] = None
         self._client_session: Optional[aiohttp.ClientSession] = None
 
-        logging.info("loading tokenizer: %s", tokenizer_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        logging.info("tokenizer loaded: vocab_size=%d", len(self.tokenizer))
+        if no_lookup_route:
+            self.tokenizer = None
+            logging.info("no_lookup_route=True; skipping tokenizer load")
+        else:
+            logging.info("loading tokenizer: %s", tokenizer_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            logging.info("tokenizer loaded: vocab_size=%d", len(self.tokenizer))
 
         # Round-robin counter for fallback-mode replica selection.
         self._rr_counter = 0
@@ -155,6 +169,7 @@ class LookupProxy:
             "lookup_timeout": 0,
             "lookup_errors": 0,
             "lookup_skipped_no_chain": 0,
+            "lookup_disabled": 0,
             "routed_to_hint": 0,
             "routed_round_robin_fallback": 0,
             "lookup_latency_us_sum": 0.0,
@@ -164,8 +179,9 @@ class LookupProxy:
         }
 
     async def setup(self) -> None:
-        self._channel = grpc.aio.insecure_channel(self.ic_server)
-        self._stub = pb_grpc.InferenceCacheStub(self._channel)
+        if not self.no_lookup_route:
+            self._channel = grpc.aio.insecure_channel(self.ic_server)
+            self._stub = pb_grpc.InferenceCacheStub(self._channel)
         self._client_session = aiohttp.ClientSession()
 
     async def teardown(self) -> None:
@@ -309,19 +325,30 @@ class LookupProxy:
             return web.Response(status=400, text="malformed JSON")
 
         model = payload.get("model", "")
-        token_ids = self._extract_prompt_tokens(payload)
 
-        replica_id_local, hashes, counts = self.event_index.find_best_chain(token_ids)
-        if hashes:
-            hint_replica, reason = await self._lookup_with_chain(
-                tenant=self.tenant,
-                model=model,
-                block_hashes=hashes,
-                block_token_counts=counts,
-            )
+        if self.no_lookup_route:
+            # CAC-153: routing layer disabled — skip tokenize / chain-walk /
+            # LookupRoute entirely. Fallback round-robin across --replicas is
+            # the whole behavior in this mode.
+            self.stats["lookup_disabled"] += 1
+            token_ids: list = []
+            replica_id_local: Optional[str] = None
+            hashes: list = []
+            reason = "LOOKUP_DISABLED"
+            hint_replica: Optional[str] = None
         else:
-            self.stats["lookup_skipped_no_chain"] += 1
-            hint_replica, reason = None, "NO_CHAIN_OBSERVED"
+            token_ids = self._extract_prompt_tokens(payload)
+            replica_id_local, hashes, counts = self.event_index.find_best_chain(token_ids)
+            if hashes:
+                hint_replica, reason = await self._lookup_with_chain(
+                    tenant=self.tenant,
+                    model=model,
+                    block_hashes=hashes,
+                    block_token_counts=counts,
+                )
+            else:
+                self.stats["lookup_skipped_no_chain"] += 1
+                hint_replica, reason = None, "NO_CHAIN_OBSERVED"
 
         upstream_url, route_reason = self._pick_upstream(hint_replica)
 
@@ -614,51 +641,60 @@ async def main_async(args: argparse.Namespace) -> None:
         event_index=index,
         tenant=args.tenant,
         zmq_startup_timeout_s=args.zmq_startup_timeout,
+        no_lookup_route=args.no_lookup_route,
     )
     await proxy.setup()
 
-    # Spin up subscriber tasks. When the spec carries a ROUTER endpoint
-    # (4th field), the subscriber will request seq=0 replay at startup
-    # to recover slow-joiner-lost events (CAC-136).
-    subscriber_tasks: Dict[str, asyncio.Task] = {
-        rid: asyncio.create_task(
-            subscribe_replica(index, rid, zmq_ep, router_endpoint=zmq_router)
-        )
-        for rid, zmq_ep, _http, zmq_router in args.replica
-    }
-
-    # Block startup until every replica's SUB has decoded ≥1 event, or the
-    # configured timeout elapses. Silent SUBs are a recurring failure mode
-    # (CAC-150 bug 2): if r1's PUB stream isn't being received, the chain
-    # table stays empty, every deep-prefix match falls back to r0/r2, and
-    # routing benchmarks become meaningless.
-    replica_ids = [rid for rid, *_ in args.replica]
-    if replica_ids:
-        logging.info(
-            "zmq_health.gate replicas=%s timeout_s=%.1f",
-            replica_ids, args.zmq_startup_timeout,
-        )
-        silent = await await_zmq_ready(
-            index, proxy.ready, replica_ids, args.zmq_startup_timeout,
-        )
-        if silent:
-            logging.warning(
-                "zmq_health.timeout silent_replicas=%s — starting HTTP anyway; "
-                "background retry loop will attempt re-subscription every %.0fs. "
-                "Long-chain matches for these replicas will silently route elsewhere "
-                "until the SUB recovers. Inspect /proxy/metrics.prom for "
-                "lookup_proxy_zmq_events_received_total to confirm.",
-                silent, args.zmq_retry_interval,
-            )
-    else:
+    # When the routing layer is disabled (CAC-153), the chain table is unused
+    # — skip ZMQ subscriptions, the readiness gate, and the silent-SUB retry
+    # loop entirely. The HTTP listener binds immediately.
+    if args.no_lookup_route:
+        subscriber_tasks: Dict[str, asyncio.Task] = {}
+        retry_task: Optional[asyncio.Task] = None
         proxy.ready.set()
+    else:
+        # Spin up subscriber tasks. When the spec carries a ROUTER endpoint
+        # (4th field), the subscriber will request seq=0 replay at startup
+        # to recover slow-joiner-lost events (CAC-136).
+        subscriber_tasks = {
+            rid: asyncio.create_task(
+                subscribe_replica(index, rid, zmq_ep, router_endpoint=zmq_router)
+            )
+            for rid, zmq_ep, _http, zmq_router in args.replica
+        }
 
-    retry_task = asyncio.create_task(
-        retry_silent_subs(
-            index, subscriber_tasks, args.replica,
-            interval_s=args.zmq_retry_interval,
+        # Block startup until every replica's SUB has decoded ≥1 event, or the
+        # configured timeout elapses. Silent SUBs are a recurring failure mode
+        # (CAC-150 bug 2): if r1's PUB stream isn't being received, the chain
+        # table stays empty, every deep-prefix match falls back to r0/r2, and
+        # routing benchmarks become meaningless.
+        replica_ids = [rid for rid, *_ in args.replica]
+        if replica_ids:
+            logging.info(
+                "zmq_health.gate replicas=%s timeout_s=%.1f",
+                replica_ids, args.zmq_startup_timeout,
+            )
+            silent = await await_zmq_ready(
+                index, proxy.ready, replica_ids, args.zmq_startup_timeout,
+            )
+            if silent:
+                logging.warning(
+                    "zmq_health.timeout silent_replicas=%s — starting HTTP anyway; "
+                    "background retry loop will attempt re-subscription every %.0fs. "
+                    "Long-chain matches for these replicas will silently route elsewhere "
+                    "until the SUB recovers. Inspect /proxy/metrics.prom for "
+                    "lookup_proxy_zmq_events_received_total to confirm.",
+                    silent, args.zmq_retry_interval,
+                )
+        else:
+            proxy.ready.set()
+
+        retry_task = asyncio.create_task(
+            retry_silent_subs(
+                index, subscriber_tasks, args.replica,
+                interval_s=args.zmq_retry_interval,
+            )
         )
-    )
 
     app = web.Application()
     app.router.add_post("/v1/chat/completions", proxy.handle_chat)
@@ -677,15 +713,16 @@ async def main_async(args: argparse.Namespace) -> None:
     await site.start()
     logging.info(
         "lookup_proxy listening on %s; ic_server=%s; replicas=%s; "
-        "hash_scheme=%s; subscriptions=%d",
+        "hash_scheme=%s; subscriptions=%d; no_lookup_route=%s",
         args.listen, args.ic_server, proxy.replicas,
-        args.hash_scheme, len(args.replica),
+        args.hash_scheme, len(args.replica), args.no_lookup_route,
     )
 
     try:
         await asyncio.Event().wait()
     finally:
-        retry_task.cancel()
+        if retry_task is not None:
+            retry_task.cancel()
         for t in subscriber_tasks.values():
             t.cancel()
         await proxy.teardown()
@@ -695,8 +732,10 @@ async def main_async(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", default="0.0.0.0:18100")
-    ap.add_argument("--ic-server", required=True,
-                    help="inference-cache-server gRPC endpoint, e.g. localhost:38002")
+    ap.add_argument("--ic-server", required=False, default="",
+                    help="inference-cache-server gRPC endpoint, e.g. localhost:38002. "
+                         "Required unless --no-lookup-route is set, in which case the "
+                         "value is unused.")
     ap.add_argument(
         "--replicas",
         action="append",
@@ -709,8 +748,10 @@ def main() -> None:
              "Replaces the old single-pod --default-upstream — production "
              "gateways spread fallback traffic instead of concentrating it.",
     )
-    ap.add_argument("--tokenizer", required=True,
-                    help="HF tokenizer id, e.g. hf-internal-testing/llama-tokenizer")
+    ap.add_argument("--tokenizer", required=False, default="",
+                    help="HF tokenizer id, e.g. hf-internal-testing/llama-tokenizer. "
+                         "Required unless --no-lookup-route is set, in which case the "
+                         "tokenizer is not loaded.")
     ap.add_argument(
         "--replica",
         action="append",
@@ -762,8 +803,23 @@ def main() -> None:
              "recreates the silent SUB task — works around silent slow-joiner "
              "failures where the TCP connect succeeded but no events arrive.",
     )
+    ap.add_argument(
+        "--no-lookup-route",
+        action="store_true",
+        help="Skip the LookupRoute RPC, ZMQ subscriptions, and tokenizer load. "
+             "Every request round-robins across --replicas. Used by the "
+             "benchmark harness's no-hint mode (CAC-153) to measure the cache "
+             "plane with the routing layer disabled. --ic-server and "
+             "--tokenizer become optional in this mode.",
+    )
     ap.add_argument("--log", default=None)
     args = ap.parse_args()
+
+    if not args.no_lookup_route:
+        if not args.ic_server:
+            ap.error("--ic-server is required unless --no-lookup-route is set")
+        if not args.tokenizer:
+            ap.error("--tokenizer is required unless --no-lookup-route is set")
 
     # --replicas accepts both repeated flags and comma-separated values per
     # flag, so flatten before handing off.
@@ -781,7 +837,7 @@ def main() -> None:
             "single-pod fallback (CAC-154)."
         )
 
-    if not args.replica:
+    if not args.replica and not args.no_lookup_route:
         sys.stderr.write(
             "WARNING: no --replica specified. Without per-replica ZMQ subscriptions, "
             "the proxy cannot observe block hashes, so LookupRoute will always return "
