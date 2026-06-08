@@ -105,13 +105,25 @@ cmd_run() {
   local scrape_interval; scrape_interval=$(yq -r '.ic_metrics.scrape_interval_s // 10' "$cfg")
   # Dataset mode (mutually exclusive with traffic_scenarios + prefix_len).
   # Paths are resolved relative to the harness root.
-  local dataset_path; dataset_path=$(yq -r '.genai_bench.dataset_path // ""' "$cfg")
+  local dataset_path_rel; dataset_path_rel=$(yq -r '.genai_bench.dataset_path // ""' "$cfg")
+  local dataset_path="$dataset_path_rel"
   if [[ -n "$dataset_path" && "$dataset_path" != /* ]]; then
     dataset_path="$ROOT/$dataset_path"
   fi
   if [[ -n "$dataset_path" && ! -f "$dataset_path" ]]; then
     die "scenario $scenario references dataset_path=$dataset_path but the file is missing. \
 Generate it first (see the scenario's description for the generator command)."
+  fi
+
+  # Per-run dataset metadata (CAC-159) — write before the bench starts so even
+  # a failed run leaves a record of which dataset was active.
+  if [[ -n "$dataset_path" ]]; then
+    python3 "$LIB_DIR/write_dataset_meta.py" \
+      --dataset "$dataset_path" \
+      --dataset-rel "$dataset_path_rel" \
+      --scenario "$scenario" \
+      --outdir "$outdir" \
+      || color_y "  (dataset metadata writer failed — continuing)"
   fi
 
   # ---- snapshot CRDs (for the diff in `compare`) ----
