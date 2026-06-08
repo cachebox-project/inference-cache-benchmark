@@ -120,12 +120,17 @@ Generate it first (see the scenario's description for the generator command)."
     > "$outdir/crd-snapshot.yaml" 2>/dev/null || color_y "  (couldn't snapshot CRDs — skipping)"
 
   # ---- pick the target URL for this mode ----
+  # no-hint and lookup both proxy through lookup_proxy.py so genai-bench's
+  # traffic is spread across all configured replicas. no-hint adds
+  # --no-lookup-route, which skips the LookupRoute RPC and ZMQ subscriptions
+  # — every request round-robins across LOOKUP_PROXY_REPLICAS (CAC-153).
+  # Without the proxy, no-hint pointed genai-bench at a single VLLM_ENGINE_URL
+  # and collapsed to a 1-pod measurement.
   local target_url
   case "$mode" in
     baseline) target_url="$VLLM_BASELINE_URL" ;;
-    no-hint)  target_url="$VLLM_ENGINE_URL"   ;;
-    lookup)
-      color_g "[3/6] Starting LookupRoute proxy on :$LOOKUP_PROXY_PORT"
+    no-hint|lookup)
+      color_g "[3/6] Starting lookup_proxy on :$LOOKUP_PROXY_PORT (mode=$mode)"
       # Build --replica args (ZMQ subscription specs) AND the --replicas fallback
       # URL list from LOOKUP_PROXY_REPLICAS. Each spec is
       # `id|zmq_sub|http_url[|zmq_router]`; we hand the http_url field of each
@@ -142,9 +147,10 @@ Generate it first (see the scenario's description for the generator command)."
           [[ -n "$_http_url" ]] && fallback_urls+=("$_http_url")
         done
       else
-        color_y "  WARNING: LOOKUP_PROXY_REPLICAS not set. The proxy will subscribe"
-        color_y "  to zero replicas, observe no events, and return NO_HINT on every"
-        color_y "  request — degenerating to no-hint mode. See README §B-b setup."
+        color_y "  WARNING: LOOKUP_PROXY_REPLICAS not set. With no per-replica"
+        color_y "  upstreams the proxy round-robins across a single-element"
+        color_y "  --replicas list (VLLM_ENGINE_URL), collapsing both modes to"
+        color_y "  a 1-pod measurement. See README §B-b setup."
       fi
       # Fallback pool: prefer the per-replica http URLs derived above; fall
       # back to $VLLM_ENGINE_URL as a single-element list for backward compat
@@ -161,6 +167,11 @@ Generate it first (see the scenario's description for the generator command)."
       if [[ -n "${LOOKUP_PROXY_EXTRA_ARGS:-}" ]]; then
         # shellcheck disable=SC2206
         extra_args=(${LOOKUP_PROXY_EXTRA_ARGS})
+      fi
+      if [[ "$mode" == "no-hint" ]]; then
+        # no-hint mode: skip the LookupRoute RPC and ZMQ subscriptions.
+        # The proxy will round-robin every request across $replicas_csv.
+        extra_args+=("--no-lookup-route")
       fi
       PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$LIB_DIR/lookup_proxy.py" \
         --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \

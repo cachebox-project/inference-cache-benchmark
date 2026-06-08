@@ -128,11 +128,13 @@ done
 
 | Mode | What it points genai-bench at | What it tests |
 |---|---|---|
-| `baseline` | Vanilla vLLM, no cache plane at all (`VLLM_BASELINE_URL`) | Reference TTFT |
-| `no-hint` | Cache-enabled vLLM directly (`VLLM_ENGINE_URL`) | vLLM's own prefix cache + LMCache offload, with round-robin routing |
-| `lookup` | `lookup_proxy.py` in front of cache-enabled vLLM | Full system — the proxy calls `LookupRoute` before forwarding |
+| `baseline` | Vanilla vLLM, no cache plane at all (`VLLM_BASELINE_URL`) | Reference TTFT — single pod, no cache plane |
+| `no-hint` | `lookup_proxy.py --no-lookup-route` in front of cache-enabled vLLM | Cache plane up, routing layer disabled — every request round-robins across all configured `LOOKUP_PROXY_REPLICAS`. Isolates the LMCache wrapper's contribution from any LookupRoute-driven routing benefit. |
+| `lookup` | `lookup_proxy.py` in front of cache-enabled vLLM | Full system — the proxy calls `LookupRoute` and routes to the hinted replica on `PREFIX_MATCH`, otherwise round-robins across `LOOKUP_PROXY_REPLICAS` (CAC-154) |
 
-The proxy is the bit that mediates between genai-bench's "single endpoint URL" assumption and inference-cache's "list of replicas + a routing hint" model. Without the proxy, genai-bench can't exercise the routing-decision path.
+`no-hint` requires `LOOKUP_PROXY_REPLICAS` to be set so the proxy has multiple upstreams to round-robin across — with the env var unset it falls back to a single-element `--replicas` list (`VLLM_ENGINE_URL`) and collapses to a 1-pod measurement (the warning prints in that case). See **Setting up `lookup` mode** below for how to populate `LOOKUP_PROXY_REPLICAS`. The same env var serves both modes; `no-hint` only uses the HTTP-URL field of each entry (the ZMQ field is parsed but ignored, and the tokenizer / `--ic-server` are not loaded).
+
+The proxy is the bit that mediates between genai-bench's "single endpoint URL" assumption and inference-cache's "list of replicas + a routing hint" model. Without the proxy, genai-bench can't exercise the routing-decision path *and* can't spread traffic across replicas — which is why `no-hint` also routes through the proxy (just with the LookupRoute RPC short-circuited and ZMQ subscriptions skipped).
 
 ### How `lookup` mode actually works (the B-b architecture)
 
