@@ -1,0 +1,45 @@
+# Example config for oci-session-refresher.sh.
+# Copy to ~/.oci-session-refresher.conf and edit for your cluster, or pass an
+# explicit path as the first arg to the script.
+#
+# This file is sourced by bash — full shell syntax is available.
+
+PROFILE=BoatOc1
+INTERVAL=1800                        # 30 min
+# KUBECONFIG=$HOME/.kube/config-oke  # uncomment if not in the environment
+PF_LOG_DIR=/tmp
+
+# ---- Static port-forwards (svc-targeted; never need re-discovery) ----
+PF_SPECS=(
+    "38001|-n inference-cache port-forward svc/inference-cache-server :8080"   # /metrics
+    "38002|-n inference-cache port-forward svc/inference-cache-server :9090"   # gRPC
+    "38000|-n ic-smoke        port-forward svc/vllm-engine-svc        :8000"
+    "38005|-n gpu-baseline    port-forward svc/vllm-baseline          :8000"
+)
+
+# ---- Optional: per-pod port-forwards with dynamic name resolution ----
+# vLLM engine pods are part of a StatefulSet, so their names can change after
+# a restart (vllm-engine-0 → vllm-engine-0 usually stays, but the lookup is
+# still safer than hardcoding). If you define resolve_pf_specs, it's called
+# at every tick and replaces PF_SPECS entirely.
+#
+# resolve_pf_specs() {
+#     local kc_args=()
+#     [[ -n "${KUBECONFIG:-}" ]] && kc_args=(--kubeconfig "$KUBECONFIG")
+#     local pods
+#     pods=($(kubectl "${kc_args[@]}" -n ic-smoke get pod \
+#         -l app=vllm-engine -o jsonpath='{.items[*].metadata.name}' 2>/dev/null))
+#     # Static svc-targeted PFs that should always be present.
+#     PF_SPECS=(
+#         "38001|-n inference-cache port-forward svc/inference-cache-server :8080"
+#         "38002|-n inference-cache port-forward svc/inference-cache-server :9090"
+#         "38005|-n gpu-baseline    port-forward svc/vllm-baseline          :8000"
+#     )
+#     # ZMQ event port (15001+i) and HTTP serve port (38010+i) per replica.
+#     local i=0 pod
+#     for pod in "${pods[@]}"; do
+#         PF_SPECS+=("$((15001+i))|-n ic-smoke port-forward pod/$pod :5557")
+#         PF_SPECS+=("$((38010+i))|-n ic-smoke port-forward pod/$pod :8000")
+#         i=$((i+1))
+#     done
+# }

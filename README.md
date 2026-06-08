@@ -33,10 +33,13 @@ This harness adds a thin layer that:
 │   ├── lookup_proxy.py       # LookupRoute-aware HTTP proxy in front of vLLM
 │   ├── collect_ic_metrics.py # scrapes inference-cache /metrics over time
 │   └── correlate.py          # merges genai-bench + ic-metrics → markdown report
-└── scenarios/
-    ├── rag-headline.yaml     # RAG-style workload with long shared prefix
-    ├── tuning-loop.yaml      # short, cheap iteration scenario
-    └── chat-multi-turn.yaml  # chat workload — shorter prefix, more concurrency
+├── scenarios/
+│   ├── rag-headline.yaml     # RAG-style workload with long shared prefix
+│   ├── tuning-loop.yaml      # short, cheap iteration scenario
+│   └── chat-multi-turn.yaml  # chat workload — shorter prefix, more concurrency
+└── scripts/
+    ├── oci-session-refresher.sh          # keeps OCI session + kubectl PFs alive
+    └── oci-session-refresher.conf.example
 ```
 
 ## Prerequisites
@@ -79,6 +82,35 @@ You'll also need:
    ```bash
    make check-paths
    ```
+
+### Keeping port-forwards alive across long sessions
+
+`kubectl port-forward` dies silently for many reasons — server-side connection timeouts, OCI VPN blips, OKE API restarts. On OCI specifically, the OCI session token also expires on its own cadence, and once it does every `kubectl` (including any subsequent `port-forward`) starts failing with an auth error. A run that takes 4 hours in real time will routinely hit one of these.
+
+`scripts/oci-session-refresher.sh` is a long-running watchdog that handles both:
+
+- refreshes the OCI session token (`oci session refresh --profile $PROFILE`) every `$INTERVAL` seconds,
+- checks each declared local port with `lsof -ti tcp:$port -sTCP:LISTEN`, and
+- for any port that's no longer LISTEN, kills the stale `kubectl` process holding that port (if any) and re-runs `kubectl port-forward` for it.
+
+Each tick logs one summary line — `tick OK — PFs alive: 12/12` in steady state, or `tick OK — PFs alive: 12/12 — restored: 38010 15001` after a restore. Per-port kubectl output goes to `$PF_LOG_DIR/pf-<port>.log` so you can dig into why a particular PF won't stay up.
+
+```bash
+# 1. Copy the example config and edit PROFILE / KUBECONFIG / PF_SPECS for your cluster:
+cp scripts/oci-session-refresher.conf.example ~/.oci-session-refresher.conf
+$EDITOR ~/.oci-session-refresher.conf
+
+# 2. Launch detached. Output goes to wherever you redirect; logs are per-tick.
+nohup scripts/oci-session-refresher.sh > /tmp/oci-session-refresher.log 2>&1 &
+disown
+
+# 3. Tail the log to watch tick state:
+tail -f /tmp/oci-session-refresher.log
+```
+
+For pod-targeted PFs whose pod names can change after a restart (e.g. the per-replica `:5557` ZMQ ports used by `lookup` mode), the config can define a `resolve_pf_specs` shell function that's called each tick to rebuild `PF_SPECS` from `kubectl get pod` output. See the commented-out block at the bottom of the example config for the pattern.
+
+To validate restore behavior end-to-end without waiting on a real PF to die: launch the refresher with `INTERVAL=10`, find a kubectl PF process with `pgrep -fl 'kubectl.*port-forward'`, `kill -9` it, and watch the next tick log a `— restored: <port>` entry.
 
 ## Quick start
 
