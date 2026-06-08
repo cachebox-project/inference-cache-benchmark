@@ -174,6 +174,34 @@ GB_METRICS = [
     ("Output latency", "output_latency"),
 ]
 GB_STATS = ["mean", "p50", "p90", "p95", "p99", "min", "max"]
+
+# Throughput fields written by genai-bench per (scenario, concurrency) run.
+# Field names vary across genai-bench versions; we try a few synonyms and take
+# the first hit. Scalar OR StatField (in which case we use .mean).
+GB_THROUGHPUT_FIELDS = [
+    ("input tok/s", [
+        "input_throughput_tokens_per_s",
+        "input_throughput",
+        "mean_input_throughput_tokens_per_second",
+    ]),
+    ("output tok/s", [
+        "output_throughput_tokens_per_s",
+        "output_throughput",
+        "mean_output_throughput_tokens_per_second",
+    ]),
+    ("requests/s", [
+        "requests_per_second",
+        "request_throughput",
+        "requests_throughput_per_s",
+        "mean_request_throughput_per_second",
+    ]),
+]
+# Per-request token counts come from StatFields named num_*_tokens
+# (we render the .mean as the "avg" column).
+GB_AVG_TOKEN_FIELDS = [
+    ("avg input tok", "num_input_tokens"),
+    ("avg output tok", "num_output_tokens"),
+]
 # genai-bench reports these latencies in SECONDS. We render ms. If a future
 # genai-bench version emits ms, flip this to False (sanity-check run #1 against
 # the genai-bench Excel — a 27B-INT4 TTFT should be hundreds of ms, not <1).
@@ -225,6 +253,193 @@ def load_gb_runs(genai_bench_dir: str) -> Dict[int, Dict[str, dict]]:
         if fields:
             runs[conc] = fields
     return runs
+
+
+def _find_scalar(node, keys: List[str]):
+    """First-hit walker for scalar OR StatField values under one of `keys`.
+
+    For StatField (a dict with mean/p99), returns the `.mean` value. Returns
+    None if none of the candidate keys are reached anywhere in the tree.
+    """
+    if isinstance(node, dict):
+        for k in keys:
+            if k in node:
+                v = node[k]
+                if isinstance(v, dict):
+                    if "mean" in v and isinstance(v["mean"], (int, float)):
+                        return float(v["mean"])
+                elif isinstance(v, (int, float)):
+                    return float(v)
+        for vv in node.values():
+            r = _find_scalar(vv, keys)
+            if r is not None:
+                return r
+    elif isinstance(node, list):
+        for vv in node:
+            r = _find_scalar(vv, keys)
+            if r is not None:
+                return r
+    return None
+
+
+def load_gb_throughput(genai_bench_dir: str) -> Dict[int, Dict[str, Optional[float]]]:
+    """Return {concurrency: {field_label: value}} for the throughput section.
+
+    Walks each per-concurrency JSON for (a) throughput scalars surfaced by
+    genai-bench and (b) per-request token counts under num_input_tokens /
+    num_output_tokens. Missing fields stay None — the renderer prints "—".
+    """
+    out: Dict[int, Dict[str, Optional[float]]] = {}
+    if not os.path.isdir(genai_bench_dir):
+        return out
+    for path in glob.glob(os.path.join(genai_bench_dir, "**", "*.json"), recursive=True):
+        m = _CONC_RE.search(os.path.basename(path))
+        if not m:
+            continue
+        conc = int(m.group(1))
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        agg = data.get("aggregated_metrics", data)
+        row: Dict[str, Optional[float]] = {}
+        for label, candidates in GB_THROUGHPUT_FIELDS:
+            row[label] = _find_scalar(agg, candidates)
+        for label, key in GB_AVG_TOKEN_FIELDS:
+            sf = _find_statfield(agg, key)
+            mean = sf.get("mean") if isinstance(sf, dict) else None
+            row[label] = float(mean) if isinstance(mean, (int, float)) else None
+        if any(v is not None for v in row.values()):
+            out[conc] = row
+    return out
+
+
+def render_throughput_table(genai_bench_dir: str) -> List[str]:
+    """Single-run throughput section. One row per concurrency."""
+    runs = load_gb_throughput(genai_bench_dir)
+    out = ["## Throughput (per concurrency)", ""]
+    if not runs:
+        out.append("_No throughput fields parsed — see `genai-bench/` for raw Excel._")
+        out.append("")
+        return out
+    cols = [label for label, _ in GB_THROUGHPUT_FIELDS] + [label for label, _ in GB_AVG_TOKEN_FIELDS]
+    out.append("| concurrency | " + " | ".join(cols) + " |")
+    out.append("|---|" + "---|" * len(cols))
+    for conc in sorted(runs):
+        cells = [f"c={conc}"]
+        for col in cols:
+            v = runs[conc].get(col)
+            cells.append("—" if v is None else f"{v:,.1f}")
+        out.append("| " + " | ".join(cells) + " |")
+    out.append("")
+    return out
+
+
+def render_throughput_comparison(rundirs: List[Tuple[str, str]]) -> List[str]:
+    """Compare: per-concurrency throughput across labels, with Δ column."""
+    per_label = [(lab, load_gb_throughput(os.path.join(d, "genai-bench"))) for lab, d in rundirs]
+    all_conc = sorted({c for _lab, runs in per_label for c in runs})
+    out = ["## Throughput — side by side (per concurrency)", ""]
+    if not all_conc:
+        out.append("_No throughput fields parsed in any run dir._")
+        out.append("")
+        return out
+    cols = [label for label, _ in GB_THROUGHPUT_FIELDS] + [label for label, _ in GB_AVG_TOKEN_FIELDS]
+    multi = len(per_label) >= 2
+    for conc in all_conc:
+        out.append(f"### Concurrency {conc}")
+        out.append("")
+        hdr = ["Metric"] + [lab for lab, _ in per_label] + (["Δ (last−first)"] if multi else [])
+        out.append("| " + " | ".join(hdr) + " |")
+        out.append("|" + "---|" * len(hdr))
+        for col in cols:
+            vals = [runs.get(conc, {}).get(col) for _lab, runs in per_label]
+            cells = [col] + ["—" if v is None else f"{v:,.1f}" for v in vals]
+            if multi and vals[0] is not None and vals[-1] is not None:
+                d = vals[-1] - vals[0]
+                pct = (d / vals[0] * 100) if vals[0] else 0
+                cells.append(f"{d:+,.1f} ({pct:+.1f}%)")
+            out.append("| " + " | ".join(cells) + " |")
+        out.append("")
+    return out
+
+
+# Run-window aggregate throughput from vllm-metrics.csv ----------------------
+#
+# When genai-bench's per-concurrency throughput scalars are missing (older
+# versions, partial JSONs, etc.), the vllm-metrics scraper still gives us a
+# cluster-aggregate floor: sum of (prompt_tokens_total Δ) and
+# (generation_tokens_total Δ) across pods over the wall-clock run window.
+
+def _vllm_metric_total_delta(
+    rows: List[dict], metric_prefix: str
+) -> Optional[float]:
+    """Sum (last − first) across all columns whose key starts with `metric_prefix{`.
+
+    Returns None if no matching columns or insufficient samples.
+    """
+    if len(rows) < 2:
+        return None
+    first, last = rows[0], rows[-1]
+    matched = False
+    total = 0.0
+    for col, v in last.items():
+        if not col.startswith(metric_prefix + "{"):
+            continue
+        if not isinstance(v, float):
+            continue
+        before = first.get(col, 0.0) if isinstance(first.get(col), float) else 0.0
+        total += (v - before)
+        matched = True
+    return total if matched else None
+
+
+def _vllm_run_window_seconds(rows: List[dict]) -> Optional[float]:
+    """Wall-clock seconds between the first and last scrape ts in vllm-metrics.csv."""
+    if len(rows) < 2:
+        return None
+    try:
+        start = float(rows[0].get("ts"))
+        end = float(rows[-1].get("ts"))
+    except (TypeError, ValueError):
+        return None
+    return end - start if end > start else None
+
+
+def render_vllm_aggregate_throughput(rundir: str) -> List[str]:
+    """Single-run vllm-metrics.csv aggregate (across all pods, full run window)."""
+    csv_path = os.path.join(rundir, "vllm-metrics.csv")
+    rows = load_ic_metrics_csv(csv_path)
+    out = ["## vLLM aggregate throughput (run window, all pods)", ""]
+    if not rows:
+        out.append("_No vllm-metrics.csv — vLLM scraper not enabled for this run._")
+        out.append("")
+        return out
+    duration = _vllm_run_window_seconds(rows)
+    input_delta = _vllm_metric_total_delta(rows, "vllm:prompt_tokens_total")
+    output_delta = _vllm_metric_total_delta(rows, "vllm:generation_tokens_total")
+    req_delta = _vllm_metric_total_delta(rows, "vllm:request_success_total")
+    out.append("| Metric | Value |")
+    out.append("|---|---|")
+    out.append(f"| Run window | {duration:.1f} s |" if duration else "| Run window | — |")
+    if duration and input_delta is not None:
+        out.append(f"| Input tokens/s (sum-of-pods) | {input_delta / duration:,.1f} |")
+    if duration and output_delta is not None:
+        out.append(f"| Output tokens/s (sum-of-pods) | {output_delta / duration:,.1f} |")
+    if duration and req_delta is not None:
+        out.append(f"| Requests/s (sum-of-pods) | {req_delta / duration:,.2f} |")
+    # Per-pod T1/T2 hit rates
+    t1_q = _vllm_metric_total_delta(rows, "vllm:prefix_cache_queries_total")
+    t1_h = _vllm_metric_total_delta(rows, "vllm:prefix_cache_hits_total")
+    t2_q = _vllm_metric_total_delta(rows, "vllm:external_prefix_cache_queries_total")
+    t2_h = _vllm_metric_total_delta(rows, "vllm:external_prefix_cache_hits_total")
+    if t1_q and t1_q > 0 and t1_h is not None:
+        out.append(f"| T1 (vLLM local prefix-cache) hit rate | {100.0 * t1_h / t1_q:.1f}% |")
+    if t2_q and t2_q > 0 and t2_h is not None:
+        out.append(f"| T2 (external/LMCache) hit rate | {100.0 * t2_h / t2_q:.1f}% |")
+    out.append("")
+    return out
 
 
 def _fmt_lat(v) -> str:
@@ -338,6 +553,11 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
     # Full latency breakdown (TTFT / TPOT / E2E / output) × stats, per concurrency
     out.extend(render_latency_tables(os.path.join(rundir, "genai-bench")))
 
+    # Throughput — per-concurrency from genai-bench JSON, plus an aggregate
+    # row-totals view from vllm-metrics.csv when available (Phase 3).
+    out.extend(render_throughput_table(os.path.join(rundir, "genai-bench")))
+    out.extend(render_vllm_aggregate_throughput(rundir))
+
     # Acceptance gate
     accept = scenario.get("acceptance") or {}
     if accept:
@@ -373,6 +593,8 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
     out.append(f"- `{rundir}/scenario.yaml` — exact scenario used")
     out.append(f"- `{rundir}/genai-bench/` — genai-bench experiment dir (Excel via `genai-bench excel`)")
     out.append(f"- `{rundir}/ic-metrics.csv` — inference-cache /metrics scraped every {scenario.get('ic_metrics',{}).get('scrape_interval_s', 10)}s")
+    if os.path.exists(os.path.join(rundir, "vllm-metrics.csv")):
+        out.append(f"- `{rundir}/vllm-metrics.csv` — per-pod vLLM /metrics (Phase 3)")
     out.append(f"- `{rundir}/crd-snapshot.yaml` — CRDs at run time")
     if mode == "lookup":
         out.append(f"- `{rundir}/lookup_proxy.log` — proxy log (LookupRoute call traces)")
@@ -440,6 +662,9 @@ def emit_comparison_report(results_dir: str, labels: List[str]) -> str:
 
     # Full latency breakdown (TTFT / TPOT / E2E / output) × stats, per concurrency
     out.extend(render_latency_comparison(rundirs))
+
+    # Throughput side-by-side
+    out.extend(render_throughput_comparison(rundirs))
 
     # CRD diff between A and B (first two only — multi-way diff is too noisy)
     if len(rundirs) >= 2:

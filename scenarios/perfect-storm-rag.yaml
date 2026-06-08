@@ -1,0 +1,86 @@
+name: perfect-storm-rag
+description: |
+  Best-case demo of system efficiency — 150 distinct ~8000-token contexts ×
+  100 questions each = 15,000 prompts. Phase 3 portfolio scenario: the
+  working set is deliberately sized to JUST overflow a single-pod T1 cache
+  while comfortably fitting in the 3-pod spread. Maximum-gap showcase between
+  baseline and lookup modes.
+
+  Sizing math:
+    Working set:         150 × ~8000  = 1.2M prefix tokens
+    Per-replica share:   1.2M / 3     ≈ 400K   (just fits T1 ≈ 450K)
+    Baseline (1 pod):    1.2M         ≈ 2.6× T1 → constant eviction
+    Reuse:               100 questions per context → extreme reuse
+    Total prompts:       15,000 — long enough to amortize cold start across
+                         four concurrency points
+
+  Expected mode-by-mode behaviour:
+    baseline  (vanilla vLLM)   — T1 thrashes the whole time. The 100×
+                                  question rotation per context guarantees
+                                  every prefix is re-encountered after
+                                  eviction. Worst-case TTFT — the headline
+                                  number we beat.
+    no-hint   (cache plane up) — LMCache T2 absorbs T1 evictions. Repeat
+                                  hits succeed at T2 latency but never get
+                                  back into T1 because round-robin spreads
+                                  every prefix across all pods on every
+                                  question rotation.
+    lookup    (full system)    — Routing affinity pins each context to a
+                                  single replica. Per-replica working set
+                                  fits in T1, so after one cold pass the
+                                  next 99 questions per context all hit
+                                  T1-resident. Best-case TTFT — the headline
+                                  number we publish.
+
+  Why this scenario is the headline demo:
+    - The arithmetic is tight enough that the lookup win is obvious without
+      cherry-picking concurrency levels.
+    - 15,000 prompts × 4 concurrencies × 3 modes × 4 iters fits inside a
+      single workday's compute budget on a 3-pod cluster.
+    - 100-question rotation per context is high enough that the steady-state
+      hit rate floors at ~99% in lookup mode (1 cold per 100 reused).
+
+  Use this scenario when:
+    - Producing the "Phase 3 launch claim" headline numbers
+    - Brown-bag benchmark showcasing system efficiency
+    - Re-validating after major routing-layer releases (CAC-166 etc.)
+
+  Setup (one-time):
+    python scenarios/datasets/gen_perfect_storm_rag.py
+    # writes scenarios/datasets/perfect_storm_rag.txt
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  tokenizer: hf-internal-testing/llama-tokenizer
+  dataset_path: scenarios/datasets/perfect_storm_rag.txt
+  num_concurrency: [4, 8, 16, 32]
+  max_requests_per_run: 5000
+  max_time_per_run: 15            # minutes; per concurrency point
+
+ic_metrics:
+  scrape_interval_s: 10
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_lookup_route_latency_seconds
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+    - inferencecache_policy_auth_total
+
+vllm_metrics:
+  scrape_interval_s: 30
+  capture:
+    - vllm:prefix_cache_queries_total
+    - vllm:prefix_cache_hits_total
+    - vllm:external_prefix_cache_queries_total
+    - vllm:external_prefix_cache_hits_total
+    - vllm:request_success_total
+    - vllm:prompt_tokens_total
+    - vllm:generation_tokens_total
+
+acceptance:
+  # Steady-state lookup-mode hit rate floors near 99% (1 cold / 100 reused per
+  # context) — set the gate conservatively below to leave headroom for the
+  # cold-start window across concurrency sweeps.
+  lookup_hit_rate_pct_min: 90

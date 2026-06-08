@@ -225,6 +225,65 @@ done
 ./run_tuning_bench.sh compare v1-baseline v1-no-hint v1-lookup
 ```
 
+### Phase 3 sweep
+
+For the brown-bag headline benchmark, three new scenarios live alongside
+`rag-headline` (full details in [`scenarios/README.md`](scenarios/README.md)):
+
+| Scenario | Working set | What it shows |
+|---|---|---|
+| `rag-multi-context` | 1.1M tokens (200 × 5500) | Moderate WS: baseline thrashes T1, 3-pod spread fits — routing affinity wins |
+| `cache-stress-extreme` | 7M tokens (1000 × 7000) | T1+T2 hierarchy under stress; graceful degradation |
+| `perfect-storm-rag` | 1.2M tokens (150 × 8000) | Maximum-delta showcase — steady-state hit rate ≈ 99% in lookup mode |
+
+Each scenario specifies four concurrency points (`[4, 8, 16, 32]`); the
+`scripts/phase3-sweep.sh` orchestrator runs all three across the three modes
+(`baseline` / `no-hint` / `lookup`) and four iterations (`cold`, `warm-1`,
+`warm-2`, `warm-3`). Cold iters do a `kubectl rollout restart` between runs;
+warm iters reuse the cache state from the previous run to capture warmup →
+steady-state transitions.
+
+```bash
+# Generate datasets first (one-time):
+python scenarios/datasets/gen_rag_multi_context.py
+python scenarios/datasets/gen_cache_stress.py \
+    --num-prefixes 1000 --questions-per-prefix 3 --words-per-prefix 5500 \
+    --output scenarios/datasets/cache_stress_extreme.txt
+python scenarios/datasets/gen_perfect_storm_rag.py
+
+# Run the full 36-bench matrix (3 scenarios × 3 modes × 4 iters):
+scripts/phase3-sweep.sh
+
+# Or a subset — useful for rerunning after a failure:
+scripts/phase3-sweep.sh --scenarios "perfect-storm-rag" --iters "cold warm-1"
+
+# Dry-run (echo commands without executing):
+scripts/phase3-sweep.sh --dry-run
+
+# Build comparison reports only (skips re-running):
+scripts/phase3-sweep.sh --compare-only
+```
+
+Interpreting the output:
+
+- Each iteration writes a `results/phase3-<scenario>-<mode>-<iter>-<ts>/`
+  directory with the usual `report.md`, `ic-metrics.csv`,
+  `vllm-metrics.csv` (Phase 3), `cluster-state.yaml`, etc.
+- The orchestrator builds a three-way comparison per scenario at the end
+  (`results/compare-phase3-<scenario>-{baseline,no-hint,lookup}-cold-<ts>.md`),
+  using the `cold` iters as the headline numbers.
+- The headline is the **delta** between modes within a single scenario, not
+  absolute numbers across scenarios.
+- Warm iters live alongside the cold runs for tail-analysis; load them
+  manually with `./run_tuning_bench.sh compare <label1> <label2>` if you
+  want a warmup-vs-steady-state view.
+
+Per-pod vLLM metrics (`vllm-metrics.csv`) are scraped automatically when
+`VLLM_METRICS_ENDPOINTS` is set or derivable from `LOOKUP_PROXY_REPLICAS` —
+baseline mode auto-derives one endpoint from `VLLM_BASELINE_URL`. Each
+`report.md` now includes a "Throughput (per concurrency)" section and a
+"vLLM aggregate throughput" section computed from those CSVs.
+
 ## Modes
 
 | Mode | What it points genai-bench at | What it tests |

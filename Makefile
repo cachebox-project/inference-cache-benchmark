@@ -116,8 +116,15 @@ check-pod-distribution:
 	@echo "  python3 lib/check_pod_distribution.py diff --before /tmp/ic-dist-check/before.json --out /tmp/ic-dist-check/report.json"
 
 # ---- datasets: pre-generated prompts files referenced by scenarios ----
+# Generates the dataset files for every scenario YAML that uses dataset_path.
+# Phase 3 adds two new RAG generators and a second cache-stress sizing.
 datasets:
 	@python3 scenarios/datasets/gen_cache_stress.py
+	@python3 scenarios/datasets/gen_cache_stress.py \
+	    --num-prefixes 1000 --questions-per-prefix 3 --words-per-prefix 5500 \
+	    --output scenarios/datasets/cache_stress_extreme.txt
+	@python3 scenarios/datasets/gen_rag_multi_context.py
+	@python3 scenarios/datasets/gen_perfect_storm_rag.py
 	@echo "✓ Generated all dataset files in scenarios/datasets/"
 
 # ---- clean ----

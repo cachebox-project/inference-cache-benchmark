@@ -189,6 +189,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--shuffle-seed", type=str, default=DEFAULT_SHUFFLE_SEED,
         help="Seed for the final prompt-order shuffle.",
     )
+    p.add_argument(
+        "--no-shuffle", action="store_true",
+        help="Emit prompts in prefix-major order (default: shuffled for no temporal locality).",
+    )
     return p.parse_args(argv)
 
 
@@ -212,6 +216,7 @@ def write_meta_sidecar(meta_path: str, args: argparse.Namespace, num_prompts: in
         f.write(f"words_per_prefix: {args.words_per_prefix}\n")
         f.write(f"prefix_seed: {args.prefix_seed!r}\n")
         f.write(f"shuffle_seed: {args.shuffle_seed!r}\n")
+        f.write(f"shuffled: {not args.no_shuffle}\n")
         f.write(f"total_prompts: {num_prompts}\n")
 
 
@@ -228,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
         for q_idx in range(q_count):
             q = QUESTIONS[q_idx]
             prompts.append(f"{prefix} Question: {q}")
-    random.Random(args.shuffle_seed).shuffle(prompts)
+    if not args.no_shuffle:
+        random.Random(args.shuffle_seed).shuffle(prompts)
     with open(out_path, "w") as f:
         for p in prompts:
             f.write(p + "\n")
