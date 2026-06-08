@@ -268,6 +268,15 @@ Generate it first (see the scenario's description for the generator command)."
     --output "$outdir/ic-metrics.csv" &
   SCRAPER_PID=$!
 
+  # ---- pre-run per-pod distribution snapshot (CAC-163) ----
+  # No-op when LOOKUP_PROXY_REPLICAS is unset. When set, scrapes each pod's
+  # vllm:prefix_cache_queries_total; the post-run diff fails loud if any pod
+  # received zero traffic while siblings got some — the signature of a
+  # `kubectl port-forward svc/...` PF-pinning misconfiguration.
+  python3 "$LIB_DIR/check_pod_distribution.py" snapshot \
+    --out "$outdir/dist-before.json" \
+    || color_y "  (dist-check snapshot failed — continuing)"
+
   # ---- run genai-bench ----
   color_g "[6/7] Running genai-bench"
   local gb_args=(
@@ -300,6 +309,17 @@ Generate it first (see the scenario's description for the generator command)."
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null
   sleep 2
   kill "$SCRAPER_PID" 2>/dev/null
+
+  # ---- post-run distribution check (CAC-163) ----
+  # Exit-code semantics: 0 = ok/skipped/idle, 2 = imbalanced. We capture the
+  # rc but don't abort the run — the report.md still has value, and we want
+  # the warning printed prominently at the end of the run.
+  set +e
+  python3 "$LIB_DIR/check_pod_distribution.py" diff \
+    --before "$outdir/dist-before.json" \
+    --out    "$outdir/dist-report.json"
+  DIST_RC=$?
+  set -e 2>/dev/null || true
 
   # ---- cluster-state: pod snapshot at run end + finalize (CAC-161) ----
   # Runs even on a failed bench — that's the case we most want pod state for.
@@ -336,6 +356,10 @@ Generate it first (see the scenario's description for the generator command)."
     > "$outdir/report.md"
 
   color_g "Done.  Report: $outdir/report.md"
+  if [[ "${DIST_RC:-0}" == "2" ]]; then
+    color_r "WARNING: per-pod distribution check flagged imbalance — see $outdir/dist-report.json"
+    color_r "         (likely cause: kubectl port-forward svc/... pins to one pod; see README Prerequisites)"
+  fi
   echo
   head -40 "$outdir/report.md"
 }

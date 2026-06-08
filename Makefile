@@ -3,7 +3,7 @@
 # Common entry points so you don't have to remember the exact protoc invocation
 # or which port-forwards the run script expects.
 
-.PHONY: help proto install lint smoke test clean check-paths datasets
+.PHONY: help proto install lint smoke test clean check-paths check-pod-distribution datasets
 
 # Where the main inference-cache repo lives. Override on the command line:
 #   make proto INFERENCE_CACHE_REPO=/path/to/inference-cache
@@ -18,6 +18,7 @@ help:
 	@echo "make smoke              List available scenarios (sanity check)"
 	@echo "make test               Run the proxy/event-index pytest suite"
 	@echo "make check-paths        Verify port-forwards and proto stubs before a real run"
+	@echo "make check-pod-distribution  Sanity-check that all replicas in LOOKUP_PROXY_REPLICAS are receiving traffic"
 	@echo "make clean              Remove proto/, results/*/, __pycache__"
 	@echo ""
 	@echo "Overrides:"
@@ -99,6 +100,20 @@ check-paths:
 	@nc -z $${IC_SERVER_GRPC:-localhost:38002 | tr : ' '} 2>/dev/null \
 	  && echo "  ✓ IC_SERVER_GRPC reachable" \
 	  || echo "  ? IC_SERVER_GRPC — port check inconclusive (run a real LookupRoute via grpcurl to confirm)"
+
+# ---- check-pod-distribution: standalone before/after distribution check ----
+# Useful for quick spot-checks outside a full benchmark run. Take a snapshot,
+# run some traffic against the proxy or service, then diff. Requires
+# LOOKUP_PROXY_REPLICAS env var (per-pod HTTP URLs).
+check-pod-distribution:
+	@test -n "$$LOOKUP_PROXY_REPLICAS" || { \
+	  echo "LOOKUP_PROXY_REPLICAS unset — see README §Setting up lookup mode"; \
+	  exit 1; \
+	}
+	@mkdir -p /tmp/ic-dist-check
+	@python3 lib/check_pod_distribution.py snapshot --out /tmp/ic-dist-check/before.json
+	@echo "Snapshot written. Drive traffic, then run:"
+	@echo "  python3 lib/check_pod_distribution.py diff --before /tmp/ic-dist-check/before.json --out /tmp/ic-dist-check/report.json"
 
 # ---- datasets: pre-generated prompts files referenced by scenarios ----
 datasets:
