@@ -131,6 +131,51 @@ Produces `results/current-<timestamp>/`:
 - `scenario.yaml` — the scenario YAML used (verbatim copy)
 - `dataset.txt` — dataset fingerprint (path, SHA-256, line count, first-prompt
   head, generator config) — only written when the scenario uses `dataset_path`
+- `cluster-state.yaml` — pod + node + event snapshot for the run window (see below)
+
+### cluster-state.yaml — why it's there
+
+When a pod restarts mid-run (lm-smoke OOM, vllm-engine rolling restart, kubelet
+eviction, etc.), the bench result on its own gives no signal about *why* things
+went sideways — by the time you go looking, the cluster state that explained it
+is gone. `cluster-state.yaml` is the smallest artifact that lets you do
+post-mortem days later without a live cluster.
+
+Per run, the harness captures:
+
+- **`pods_start` / `pods_end`** — name, namespace, pod_uid, node, age, and
+  `restart_count` for the configured targets at the run boundaries. Two
+  comparisons matter: `pod_uid` changes mean the pod was deleted+recreated;
+  `restart_count` deltas mean a container restarted in place.
+- **`pod_changes`** — a denormalised summary of those deltas so the headline
+  ("lm-smoke-yyy was restarted") is visible without diffing the two lists.
+- **`events`** — pod-level events (`OOMKilled`, `BackOff`, `FailedScheduling`,
+  …) from the configured namespaces that fall inside the run window. Pulled
+  via `kubectl get events --field-selector involvedObject.namespace=<ns>`.
+- **`nodes`** — capacity, allocatable, and pressure conditions for every node
+  hosting one of the captured pods.
+
+Which pods to capture is controlled by `CLUSTER_STATE_TARGETS`, a
+comma-separated list of `<namespace>:<name-prefix>` pairs. The default targets
+the Phase 2 setup:
+
+```
+CLUSTER_STATE_TARGETS="ic-smoke:vllm-engine,ic-smoke:lm-smoke,gpu-baseline:vllm-baseline"
+```
+
+Override it for a different workload layout — e.g. a Qwen sweep:
+
+```bash
+export CLUSTER_STATE_TARGETS="ic-smoke:qwen-vllm,gpu-baseline:qwen-baseline"
+./run_tuning_bench.sh run --scenario rag-headline --label qwen-trial --mode lookup
+```
+
+Events are pulled from the unique namespaces in `CLUSTER_STATE_TARGETS`
+unless you set `CLUSTER_STATE_EVENTS_NS` explicitly (also comma-separated).
+
+All kubectl calls are best-effort: any failure (no cluster context, missing
+namespace, RBAC denial) is logged in yellow and the run continues. The merged
+yaml will contain an `error:` field instead of pod data.
 
 ### The tuning loop
 
