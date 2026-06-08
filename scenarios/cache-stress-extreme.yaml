@@ -1,0 +1,83 @@
+name: cache-stress-extreme
+description: |
+  Production-scale diverse stress — 1000 distinct ~7000-token prefixes ×
+  3 questions = 3000 prompts. Phase 3 portfolio scenario: oversize the
+  working set so even the 3-pod spread is forced to evict, exercising both
+  T1 and T2 of the cache hierarchy.
+
+  Sizing math:
+    Working set:         1000 × ~7000 = 7M prefix tokens
+    Per-replica share:   7M / 3       ≈ 2.3M  (≈ 5× T1, ≈ 0.5× T2)
+    Baseline (1 pod):    7M           ≈ 15× T1 → continuous eviction
+    Reuse:               3 questions per prefix → mid-low temporal locality
+
+  Expected mode-by-mode behaviour:
+    baseline  (vanilla vLLM)   — T1 thrashes constantly. Most prefix reuse
+                                  costs full prefill. TTFT p50 elevated;
+                                  long-tail latency dominated by re-prefill.
+    no-hint   (cache plane up) — T1 evictions land in T2; repeat hits pull
+                                  back from T2 at LMCache-load latency.
+                                  Wins vs. baseline but loses cross-pod
+                                  routing benefit (round-robin shuffles
+                                  every prefix across all pods).
+    lookup    (full system)    — Routing affinity keeps each prefix sticky
+                                  to one replica. Even though per-replica
+                                  capacity is exceeded, the affinity-driven
+                                  ordering means each pod's working set is
+                                  ~1/3 the total — T2 hits dominate, T1
+                                  hits return on subsequent re-runs.
+                                  Biggest delta materializes once CAC-166
+                                  prompt-hash affinity ships (currently
+                                  routing is content-anchored).
+
+  Use this scenario when:
+    - Stress-testing T1+T2 hierarchy under extreme working-set sizes
+    - Validating that the cache plane degrades gracefully (T1 → T2 → re-
+      prefill) rather than cliff-edging
+    - Showing the routing benefit even when no pod's local cache is
+      sufficient on its own
+
+  Setup (one-time):
+    python scenarios/datasets/gen_cache_stress.py \\
+        --num-prefixes 1000 --questions-per-prefix 3 --words-per-prefix 5500 \\
+        --output scenarios/datasets/cache_stress_extreme.txt
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  tokenizer: hf-internal-testing/llama-tokenizer
+  dataset_path: scenarios/datasets/cache_stress_extreme.txt
+  num_concurrency: [4, 8, 16, 32]
+  max_requests_per_run: 3000
+  max_time_per_run: 15            # minutes; per concurrency point
+
+ic_metrics:
+  scrape_interval_s: 10
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_lookup_route_latency_seconds
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+    - inferencecache_policy_auth_total
+
+vllm_metrics:
+  scrape_interval_s: 30
+  capture:
+    - vllm:prefix_cache_queries_total
+    - vllm:prefix_cache_hits_total
+    - vllm:external_prefix_cache_queries_total
+    - vllm:external_prefix_cache_hits_total
+    - vllm:request_success_total
+    - vllm:prompt_tokens_total
+    - vllm:generation_tokens_total
+
+acceptance:
+  # No fixed TTFT target. At this working-set size every mode is going to be
+  # slower than the headline rag-multi-context numbers; the value of this
+  # scenario is the relative delta between baseline / no-hint / lookup. Use
+  # `compare` after running all three.
+  # With only 3 questions per prefix and 1000 distinct prefixes, the first
+  # request to a given prefix is always cold; the next two amortize. Hit
+  # rate target accordingly modest.
+  lookup_hit_rate_pct_min: 30

@@ -1,0 +1,72 @@
+name: rag-multi-context
+description: |
+  Moderate working-set RAG — 200 distinct ~5500-token contexts × 30 questions
+  each = 6000 prompts. Phase 3 portfolio scenario: working set is large
+  enough that a single-pod baseline thrashes T1, but small enough that the
+  3-pod spread fits comfortably in T1 once routing affinity kicks in.
+
+  Sizing math:
+    Working set:         200 × 5500 = 1.1M prefix tokens
+    Per-replica share:   1.1M / 3   ≈ 370K  (fits T1 ≈ 450K)
+    Baseline (1 pod):    1.1M       ≈ 2.5× T1  → eviction storm
+    Multiplier vs. cold: 30 questions per context → high prefix reuse
+
+  Expected mode-by-mode behaviour:
+    baseline  (vanilla vLLM)   — T1 thrashes; repeat hits cost full prefill.
+                                  TTFT p50 elevated; high variance on tail.
+    no-hint   (cache plane up) — LMCache pulls evicted blocks back from T2.
+                                  TTFT p50 recovers; T2-load latency dominates
+                                  tail (round-robin spreads working set across
+                                  pods).
+    lookup    (full system)    — Routing affinity keeps repeat-prefix requests
+                                  on the pod that still has them T1-resident.
+                                  This is the workload where lookup mode wins
+                                  biggest vs. no-hint.
+
+  Use this scenario when:
+    - Demonstrating that routing affinity (not just T2) drives the lookup win
+    - Brown-bag/launch demos: clear delta across all three modes at moderate
+      working-set sizes (the most defensible "real workload" point)
+
+  Setup (one-time):
+    python scenarios/datasets/gen_rag_multi_context.py
+    # writes scenarios/datasets/rag_multi_context.txt
+
+genai_bench:
+  task: text-to-text
+  api_backend: openai
+  model: vllm-model
+  # Public Llama tokenizer — only used for genai-bench's per-request token
+  # counting; the dataset is already raw text on disk.
+  tokenizer: hf-internal-testing/llama-tokenizer
+  dataset_path: scenarios/datasets/rag_multi_context.txt
+  num_concurrency: [4, 8, 16, 32]
+  max_requests_per_run: 2000
+  max_time_per_run: 10            # minutes; per concurrency point
+
+ic_metrics:
+  scrape_interval_s: 10
+  capture:
+    - inferencecache_lookup_route_calls_total
+    - inferencecache_lookup_route_latency_seconds
+    - inferencecache_index_entries
+    - inferencecache_index_evictions_total
+    - inferencecache_policy_auth_total
+
+vllm_metrics:
+  scrape_interval_s: 30
+  capture:
+    - vllm:prefix_cache_queries_total
+    - vllm:prefix_cache_hits_total
+    - vllm:external_prefix_cache_queries_total
+    - vllm:external_prefix_cache_hits_total
+    - vllm:request_success_total
+    - vllm:prompt_tokens_total
+    - vllm:generation_tokens_total
+
+acceptance:
+  # No fixed TTFT target — this scenario is for measuring the delta between
+  # baseline / no-hint / lookup; use `compare` after running all three modes.
+  # We expect lookup mode to deliver meaningful PREFIX_MATCH once each context
+  # has been seen at least once.
+  lookup_hit_rate_pct_min: 60

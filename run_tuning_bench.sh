@@ -21,6 +21,11 @@
 #                             (default: ic-smoke:vllm-engine,ic-smoke:lm-smoke,gpu-baseline:vllm-baseline)
 #   CLUSTER_STATE_EVENTS_NS — namespaces to pull pod events from for cluster-state.yaml
 #                             (default: unique namespaces in CLUSTER_STATE_TARGETS)
+#   VLLM_METRICS_ENDPOINTS  — per-pod vLLM /metrics URLs for the Phase 3 scraper
+#                             Comma-separated <id>=<url> pairs. (default: derived
+#                             per mode — baseline=VLLM_BASELINE_URL/metrics for
+#                             baseline mode, the LOOKUP_PROXY_REPLICAS http urls
+#                             for no-hint/lookup modes.) Set explicitly to override.
 #
 # See README.md for the full design.
 
@@ -47,6 +52,8 @@ PROTO_DIR="${INFERENCE_CACHE_PROTO_DIR:-$ROOT/proto}"
 : "${LOOKUP_PROXY_REPLICAS:=}"
 : "${CLUSTER_STATE_TARGETS:=ic-smoke:vllm-engine,ic-smoke:lm-smoke,gpu-baseline:vllm-baseline}"
 : "${CLUSTER_STATE_EVENTS_NS:=}"
+: "${VLLM_METRICS_ENDPOINTS:=}"
+: "${VLLM_METRICS_INTERVAL:=30}"
 
 # -------- helpers --------
 color_g() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -268,6 +275,43 @@ Generate it first (see the scenario's description for the generator command)."
     --output "$outdir/ic-metrics.csv" &
   SCRAPER_PID=$!
 
+  # ---- start per-pod vLLM /metrics scraper in the background (Phase 3) ----
+  # Endpoint set defaults from mode + LOOKUP_PROXY_REPLICAS; override entirely
+  # via VLLM_METRICS_ENDPOINTS (comma-separated id=url, repeated). The scraper
+  # is a no-op if no endpoints can be derived.
+  local -a vllm_endpoint_args=()
+  if [[ -n "$VLLM_METRICS_ENDPOINTS" ]]; then
+    IFS=',' read -ra _veps <<< "$VLLM_METRICS_ENDPOINTS"
+    for ep in "${_veps[@]}"; do
+      ep="${ep#"${ep%%[![:space:]]*}"}"
+      ep="${ep%"${ep##*[![:space:]]}"}"
+      [[ -z "$ep" ]] && continue
+      vllm_endpoint_args+=("--endpoint" "$ep")
+    done
+  elif [[ "$mode" == "baseline" ]]; then
+    vllm_endpoint_args+=("--endpoint" "baseline=${VLLM_BASELINE_URL%/}/metrics")
+  elif [[ -n "$LOOKUP_PROXY_REPLICAS" ]]; then
+    IFS=',' read -ra _reps <<< "$LOOKUP_PROXY_REPLICAS"
+    for r in "${_reps[@]}"; do
+      local _rid _http_url
+      _rid=$(awk -F'|' '{print $1}' <<< "$r")
+      _http_url=$(awk -F'|' '{print $3}' <<< "$r")
+      if [[ -n "$_rid" && -n "$_http_url" ]]; then
+        vllm_endpoint_args+=("--endpoint" "${_rid}=${_http_url%/}/metrics")
+      fi
+    done
+  fi
+  if (( ${#vllm_endpoint_args[@]} > 0 )); then
+    color_g "      vLLM metrics scraper: ${#vllm_endpoint_args[@]} endpoint(s), every ${VLLM_METRICS_INTERVAL}s"
+    python3 "$LIB_DIR/collect_vllm_metrics.py" \
+      "${vllm_endpoint_args[@]}" \
+      --interval "$VLLM_METRICS_INTERVAL" \
+      --output "$outdir/vllm-metrics.csv" &
+    VLLM_SCRAPER_PID=$!
+  else
+    color_y "  (no vLLM metrics endpoints derivable — skipping vllm-metrics.csv)"
+  fi
+
   # ---- pre-run per-pod distribution snapshot (CAC-163) ----
   # No-op when LOOKUP_PROXY_REPLICAS is unset. When set, scrapes each pod's
   # vllm:prefix_cache_queries_total; the post-run diff fails loud if any pod
@@ -309,6 +353,7 @@ Generate it first (see the scenario's description for the generator command)."
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null
   sleep 2
   kill "$SCRAPER_PID" 2>/dev/null
+  [[ -n "${VLLM_SCRAPER_PID:-}" ]] && kill "$VLLM_SCRAPER_PID" 2>/dev/null
 
   # ---- post-run distribution check (CAC-163) ----
   # Exit-code semantics: 0 = ok/skipped/idle, 2 = imbalanced. We capture the
