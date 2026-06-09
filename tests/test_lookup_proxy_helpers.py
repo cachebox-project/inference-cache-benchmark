@@ -1,4 +1,9 @@
-"""Unit tests for lib/lookup_proxy.py helpers — CAC-150 fix 2 + fix 3.
+"""Unit tests for lib/lookup_proxy_legacy.py helpers — CAC-150 fix 2 + fix 3.
+
+The module under test is the deprecated chain-walking proxy retained for one
+release as `lookup_proxy_legacy.py` (CAC-152). The production gateway model
+lives in `lib/dumb_gateway_client.py`; these tests guard the legacy code path
+against regressions until it's removed.
 
 Covers:
   * ``_classify_match_quality`` — trivial/weak/strong bucketing
@@ -24,7 +29,7 @@ import pytest
 pytest.importorskip("transformers")
 
 from event_index import EventIndex, BlockStored, EventBatch  # noqa: E402
-from lookup_proxy import (  # noqa: E402
+from lookup_proxy_legacy import (  # noqa: E402
     LookupProxy,
     _classify_match_quality,
     await_zmq_ready,
@@ -139,7 +144,7 @@ async def test_retry_silent_subs_restarts_silent_replica():
         ("r2", "tcp://x:3", "http://up-r2", None),
     ]
 
-    with patch("lookup_proxy.subscribe_replica", side_effect=fake_subscribe_replica):
+    with patch("lookup_proxy_legacy.subscribe_replica", side_effect=fake_subscribe_replica):
         retry_task = asyncio.create_task(
             retry_silent_subs(index, initial_tasks, specs, interval_s=0.05)
         )
@@ -188,7 +193,7 @@ async def test_retry_silent_subs_skips_when_nothing_is_flowing():
         created.append(rid)
         await asyncio.sleep(10)
 
-    with patch("lookup_proxy.subscribe_replica", side_effect=fake_subscribe_replica):
+    with patch("lookup_proxy_legacy.subscribe_replica", side_effect=fake_subscribe_replica):
         retry_task = asyncio.create_task(
             retry_silent_subs(index, tasks, specs, interval_s=0.05)
         )
@@ -230,7 +235,7 @@ async def test_handle_metrics_prom_exposes_per_replica_counter():
         ]))
 
     # Bypass the heavy tokenizer load.
-    with patch("lookup_proxy.AutoTokenizer.from_pretrained",
+    with patch("lookup_proxy_legacy.AutoTokenizer.from_pretrained",
                return_value=MagicMock(__len__=lambda self: 0)):
         proxy = LookupProxy(
             ic_server="ignored:0",
@@ -257,7 +262,7 @@ async def test_handle_metrics_prom_exposes_per_replica_counter():
 def _build_proxy(replicas):
     """Construct a LookupProxy without doing the heavy tokenizer load."""
     index = EventIndex()
-    with patch("lookup_proxy.AutoTokenizer.from_pretrained",
+    with patch("lookup_proxy_legacy.AutoTokenizer.from_pretrained",
                return_value=MagicMock(__len__=lambda self: 0)):
         return LookupProxy(
             ic_server="ignored:0",
@@ -334,7 +339,7 @@ def test_pick_upstream_falls_back_to_round_robin_when_hint_is_unknown():
 
 
 def test_lookup_proxy_rejects_empty_replicas():
-    with patch("lookup_proxy.AutoTokenizer.from_pretrained",
+    with patch("lookup_proxy_legacy.AutoTokenizer.from_pretrained",
                return_value=MagicMock(__len__=lambda self: 0)):
         with pytest.raises(ValueError, match="non-empty"):
             LookupProxy(

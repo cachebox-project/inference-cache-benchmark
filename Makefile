@@ -25,8 +25,8 @@ help:
 	@echo "  INFERENCE_CACHE_REPO=/path/to/inference-cache    (default: ../inference-cache)"
 
 # ---- proto: regenerate gRPC stubs ----
-# Without this, lookup_proxy.py imports fail. Stubs are .gitignored so every
-# fresh clone needs to run this once.
+# Without this, dumb_gateway_client.py (and the legacy lookup_proxy_legacy.py)
+# imports fail. Stubs are .gitignored so every fresh clone needs to run this once.
 proto:
 	@test -d "$(INFERENCE_CACHE_REPO)/proto" || { \
 	  echo "ERROR: $(INFERENCE_CACHE_REPO)/proto not found."; \
@@ -69,7 +69,7 @@ lint:
 	@python3 -m py_compile lib/*.py && echo "✓ python compile-checks pass"
 	@python3 -m py_compile tests/*.py && echo "✓ test compile-checks pass"
 
-# ---- test: pytest suite for lookup_proxy / event_index ----
+# ---- test: pytest suite for dumb_gateway_client / lookup_proxy_legacy / event_index ----
 # Uses pytest-asyncio; pyproject.toml sets `asyncio_mode = "auto"`. The
 # conftest shims the inference-cache gRPC stubs so tests run without
 # needing `make proto` first.

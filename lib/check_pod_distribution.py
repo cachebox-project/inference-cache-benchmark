@@ -151,7 +151,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
             f"replicas {zero} received zero traffic while {nonzero} did. "
             "Likely cause: client path doesn't load-balance "
             "(e.g. `kubectl port-forward svc/...` pins to one pod). "
-            "Use per-pod PFs through lookup_proxy.py — see benchmarks/README.md "
+            "Use per-pod PFs through dumb_gateway_client.py — see benchmarks/README.md "
             "Prerequisites callout."
         )
         rc = 2

@@ -597,7 +597,7 @@ def emit_single_run_report(scenario_path: str, label: str, mode: str, rundir: st
         out.append(f"- `{rundir}/vllm-metrics.csv` — per-pod vLLM /metrics (Phase 3)")
     out.append(f"- `{rundir}/crd-snapshot.yaml` — CRDs at run time")
     if mode == "lookup":
-        out.append(f"- `{rundir}/lookup_proxy.log` — proxy log (LookupRoute call traces)")
+        out.append(f"- `{rundir}/dumb_gateway_client.log` — client log (LookupRoute call traces + route_decision lines)")
     out.append("")
     return "\n".join(out)
 

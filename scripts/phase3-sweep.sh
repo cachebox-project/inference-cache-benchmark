@@ -28,8 +28,8 @@
 #   VLLM_ENGINE_DEPLOYMENT    name of cache-enabled vLLM deployment (default: vllm-engine)
 #   ROLLOUT_TIMEOUT           kubectl rollout status timeout (default: 10m)
 #   STALE_PROC_PATTERNS       extra pgrep patterns to clean between iters
-#                              (default: lookup_proxy.py|collect_ic_metrics.py|
-#                                        collect_vllm_metrics.py|genai-bench)
+#                              (default: dumb_gateway_client.py|lookup_proxy_legacy.py|
+#                                        collect_ic_metrics.py|collect_vllm_metrics.py|genai-bench)
 
 set -uo pipefail
 
@@ -47,7 +47,7 @@ DEFAULT_ITERS="cold warm-1 warm-2 warm-3"
 : "${LMCACHE_DEPLOYMENT:=lm-smoke}"
 : "${VLLM_ENGINE_DEPLOYMENT:=vllm-engine}"
 : "${ROLLOUT_TIMEOUT:=10m}"
-: "${STALE_PROC_PATTERNS:=lookup_proxy.py|collect_ic_metrics.py|collect_vllm_metrics.py|genai-bench}"
+: "${STALE_PROC_PATTERNS:=dumb_gateway_client.py|lookup_proxy_legacy.py|collect_ic_metrics.py|collect_vllm_metrics.py|genai-bench}"
 
 SCENARIOS="$DEFAULT_SCENARIOS"
 MODES="$DEFAULT_MODES"
