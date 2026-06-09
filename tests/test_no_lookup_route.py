@@ -1,4 +1,7 @@
-"""Unit tests for --no-lookup-route mode (CAC-153).
+"""Unit tests for --no-lookup-route mode (CAC-153) of the legacy proxy.
+
+Retained for one release as a regression guard on `lookup_proxy_legacy.py`;
+the production path is `lib/dumb_gateway_client.py` (CAC-152).
 
 When the flag is set the proxy must:
 
@@ -23,7 +26,7 @@ import pytest
 pytest.importorskip("transformers")
 
 from event_index import EventIndex  # noqa: E402
-from lookup_proxy import LookupProxy  # noqa: E402
+from lookup_proxy_legacy import LookupProxy  # noqa: E402
 
 
 REPLICA_URLS = ("http://up-r0", "http://up-r1", "http://up-r2")
@@ -36,7 +39,7 @@ def _make_proxy(no_lookup_route: bool, replicas=REPLICA_URLS):
     # but populate them so /proxy/metrics looks consistent in either mode.
     for i, _url in enumerate(replicas):
         index.add_replica(f"r{i}", _url)
-    with patch("lookup_proxy.AutoTokenizer.from_pretrained") as p:
+    with patch("lookup_proxy_legacy.AutoTokenizer.from_pretrained") as p:
         proxy = LookupProxy(
             ic_server="ignored:0",
             replicas=list(replicas),
@@ -65,7 +68,7 @@ def test_constructor_loads_tokenizer_when_lookup_enabled():
 @pytest.mark.asyncio
 async def test_setup_skips_grpc_channel_when_no_lookup_route():
     proxy = _make_proxy(no_lookup_route=True)
-    with patch("lookup_proxy.grpc.aio.insecure_channel") as mock_chan:
+    with patch("lookup_proxy_legacy.grpc.aio.insecure_channel") as mock_chan:
         await proxy.setup()
         try:
             mock_chan.assert_not_called()
@@ -80,7 +83,7 @@ async def test_setup_skips_grpc_channel_when_no_lookup_route():
 @pytest.mark.asyncio
 async def test_setup_opens_grpc_channel_when_lookup_enabled():
     proxy = _make_proxy(no_lookup_route=False)
-    with patch("lookup_proxy.grpc.aio.insecure_channel") as mock_chan:
+    with patch("lookup_proxy_legacy.grpc.aio.insecure_channel") as mock_chan:
         mock_chan.return_value = MagicMock()
         await proxy.setup()
         try:

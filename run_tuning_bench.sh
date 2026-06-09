@@ -12,9 +12,18 @@
 #   IC_SERVER_GRPC          — server gRPC endpoint               (default: localhost:38002)
 #   VLLM_ENGINE_URL         — cache-enabled vLLM HTTP URL        (default: http://localhost:38000)
 #   VLLM_BASELINE_URL       — vanilla-vLLM (no cache plane) URL  (default: http://localhost:38005)
-#   LOOKUP_PROXY_PORT       — proxy listen port (lookup mode)    (default: 18100)
-#   LOOKUP_PROXY_TOKENIZER  — HF tokenizer id (lookup mode)      (default: hf-internal-testing/llama-tokenizer)
-#   LOOKUP_PROXY_REPLICAS   — per-replica config (lookup mode)   — see README; required for PREFIX_MATCH
+#   LOOKUP_PROXY_PORT       — client listen port (lookup/no-hint mode) (default: 18100)
+#   LOOKUP_PROXY_TOKENIZER  — HF tokenizer id (lookup mode)             (default: unsloth/Meta-Llama-3.1-8B-Instruct)
+#   LOOKUP_PROXY_REPLICAS   — per-replica config (lookup/no-hint mode)  — see README; required for both modes
+#                             Format per replica: id|<zmq>|http_url[|router]
+#                             (the zmq + router fields are parsed for legacy
+#                              backward compat with the chain-walking proxy and
+#                              ignored by the dumb client — only id + http_url
+#                              are used)
+#   USE_LEGACY_PROXY        — set to 1 to invoke the deprecated lookup_proxy_legacy.py
+#                             instead of the new dumb_gateway_client.py (default: 0).
+#                             Kept for one release so operators can A/B compare
+#                             the chain-walking proxy with the production model.
 #   KUBECONFIG              — kubeconfig path for CRD snapshot   (default: from environment)
 #   CLUSTER_STATE_TARGETS   — pods to snapshot for cluster-state.yaml (CAC-161)
 #                             Comma-separated <namespace>:<name-prefix> pairs.
@@ -42,7 +51,8 @@ PROTO_DIR="${INFERENCE_CACHE_PROTO_DIR:-$ROOT/proto}"
 : "${VLLM_ENGINE_URL:=http://localhost:38000}"
 : "${VLLM_BASELINE_URL:=http://localhost:38005}"
 : "${LOOKUP_PROXY_PORT:=18100}"
-: "${LOOKUP_PROXY_TOKENIZER:=hf-internal-testing/llama-tokenizer}"
+: "${LOOKUP_PROXY_TOKENIZER:=unsloth/Meta-Llama-3.1-8B-Instruct}"
+: "${USE_LEGACY_PROXY:=0}"
 : "${WORKLOAD_NAMESPACE:=default}"
 # LOOKUP_PROXY_REPLICAS — comma-separated, one entry per replica.
 # Within a replica, use "|" as the field separator (colons are ambiguous in URLs).
@@ -197,71 +207,101 @@ Generate it first (see the scenario's description for the generator command)."
     || color_y "  (cluster-state start snapshot failed — continuing)"
 
   # ---- pick the target URL for this mode ----
-  # no-hint and lookup both proxy through lookup_proxy.py so genai-bench's
-  # traffic is spread across all configured replicas. no-hint adds
-  # --no-lookup-route, which skips the LookupRoute RPC and ZMQ subscriptions
-  # — every request round-robins across LOOKUP_PROXY_REPLICAS (CAC-153).
-  # Without the proxy, no-hint pointed genai-bench at a single VLLM_ENGINE_URL
-  # and collapsed to a 1-pod measurement.
+  # no-hint and lookup both route through the dumb gateway client so
+  # genai-bench's traffic spreads across all configured replicas. The mode
+  # selects --routing-mode:
+  #   lookup       → call LookupRoute and honor PREFIX_MATCH; round-robin
+  #                  fallback on NO_HINT / TIMEOUT / TENANT_HOT (CAC-154).
+  #   no-hint      → --routing-mode=round-robin, skipping the RPC entirely
+  #                  (CAC-153 — cache plane up, routing layer disabled).
+  # baseline points genai-bench at vanilla vLLM directly — no client at all.
   local target_url
   case "$mode" in
     baseline) target_url="$VLLM_BASELINE_URL" ;;
     no-hint|lookup)
-      color_g "[4/7] Starting lookup_proxy on :$LOOKUP_PROXY_PORT (mode=$mode)"
-      # Build --replica args (ZMQ subscription specs) AND the --replicas fallback
-      # URL list from LOOKUP_PROXY_REPLICAS. Each spec is
-      # `id|zmq_sub|http_url[|zmq_router]`; we hand the http_url field of each
-      # to --replicas so the proxy round-robins fallback traffic across all
-      # known pods instead of concentrating on one (CAC-154).
+      # USE_LEGACY_PROXY=1 lets operators A/B compare the deprecated
+      # chain-walking proxy with the production dumb-gateway model during
+      # the one-release deprecation window (CAC-152).
+      local client_script="$LIB_DIR/dumb_gateway_client.py"
+      local client_label="dumb_gateway_client"
+      if [[ "$USE_LEGACY_PROXY" == "1" ]]; then
+        client_script="$LIB_DIR/lookup_proxy_legacy.py"
+        client_label="lookup_proxy_legacy"
+        color_y "  USE_LEGACY_PROXY=1 — running the deprecated chain-walking proxy"
+      fi
+      color_g "[4/7] Starting $client_label on :$LOOKUP_PROXY_PORT (mode=$mode)"
+
+      # Build --replica args from LOOKUP_PROXY_REPLICAS (id|zmq|http_url[|router]).
+      # The dumb client only uses the id + http_url; ZMQ + router fields are
+      # parsed for legacy backward compat and ignored. The legacy proxy
+      # needs all four fields, so we pass the spec through verbatim either way.
       local -a replica_args=()
-      local -a fallback_urls=()
       if [[ -n "$LOOKUP_PROXY_REPLICAS" ]]; then
         IFS=',' read -ra _reps <<< "$LOOKUP_PROXY_REPLICAS"
         for r in "${_reps[@]}"; do
           replica_args+=("--replica" "$r")
-          # third pipe-separated field is the http upstream URL
-          local _http_url; _http_url=$(awk -F'|' '{print $3}' <<< "$r")
-          [[ -n "$_http_url" ]] && fallback_urls+=("$_http_url")
         done
       else
-        color_y "  WARNING: LOOKUP_PROXY_REPLICAS not set. With no per-replica"
-        color_y "  upstreams the proxy round-robins across a single-element"
-        color_y "  --replicas list (VLLM_ENGINE_URL), collapsing both modes to"
-        color_y "  a 1-pod measurement. See README §B-b setup."
+        color_y "  WARNING: LOOKUP_PROXY_REPLICAS not set — no replica URLs"
+        color_y "  for the client to round-robin across. Both modes will fail"
+        color_y "  to start. See README §Setting up lookup mode."
       fi
-      # Fallback pool: prefer the per-replica http URLs derived above; fall
-      # back to $VLLM_ENGINE_URL as a single-element list for backward compat
-      # if the env var was unset.
-      local replicas_csv
-      if (( ${#fallback_urls[@]} > 0 )); then
-        replicas_csv=$(IFS=','; echo "${fallback_urls[*]}")
-      else
-        replicas_csv="$VLLM_ENGINE_URL"
-      fi
-      # LOOKUP_PROXY_EXTRA_ARGS: free-form extra args appended to the proxy
-      # invocation. Useful for --replica-alias or any future flag. Word-split.
+
+      # LOOKUP_PROXY_EXTRA_ARGS: free-form extra args appended to the client
+      # invocation. Useful for --hash-scheme, --block-size, or any future flag.
       local -a extra_args=()
       if [[ -n "${LOOKUP_PROXY_EXTRA_ARGS:-}" ]]; then
         # shellcheck disable=SC2206
         extra_args=(${LOOKUP_PROXY_EXTRA_ARGS})
       fi
-      if [[ "$mode" == "no-hint" ]]; then
-        # no-hint mode: skip the LookupRoute RPC and ZMQ subscriptions.
-        # The proxy will round-robin every request across $replicas_csv.
-        extra_args+=("--no-lookup-route")
+
+      local routing_mode="lookup"
+      [[ "$mode" == "no-hint" ]] && routing_mode="round-robin"
+
+      if [[ "$USE_LEGACY_PROXY" == "1" ]]; then
+        # Legacy path: --no-lookup-route + --replicas + --tokenizer.
+        local -a fallback_urls=()
+        if [[ -n "$LOOKUP_PROXY_REPLICAS" ]]; then
+          IFS=',' read -ra _reps <<< "$LOOKUP_PROXY_REPLICAS"
+          for r in "${_reps[@]}"; do
+            local _http_url; _http_url=$(awk -F'|' '{print $3}' <<< "$r")
+            [[ -n "$_http_url" ]] && fallback_urls+=("$_http_url")
+          done
+        fi
+        local replicas_csv
+        if (( ${#fallback_urls[@]} > 0 )); then
+          replicas_csv=$(IFS=','; echo "${fallback_urls[*]}")
+        else
+          replicas_csv="$VLLM_ENGINE_URL"
+        fi
+        local -a legacy_extra=()
+        [[ "$mode" == "no-hint" ]] && legacy_extra+=("--no-lookup-route")
+        PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$client_script" \
+          --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \
+          --ic-server "$IC_SERVER_GRPC" \
+          --replicas "$replicas_csv" \
+          --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
+          --tenant "${LOOKUP_PROXY_TENANT:-$WORKLOAD_NAMESPACE}" \
+          "${replica_args[@]}" \
+          "${legacy_extra[@]}" \
+          "${extra_args[@]}" \
+          --log "$outdir/${client_label}.log" &
+      else
+        # New dumb-gateway path: --routing-mode + --replica id=url (or legacy
+        # id|zmq|http_url piped form — the parser accepts both).
+        PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$client_script" \
+          --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \
+          --ic-server "$IC_SERVER_GRPC" \
+          --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
+          --tenant "${LOOKUP_PROXY_TENANT:-$WORKLOAD_NAMESPACE}" \
+          --routing-mode "$routing_mode" \
+          "${replica_args[@]}" \
+          "${extra_args[@]}" \
+          --log "$outdir/${client_label}.log" &
       fi
-      PYTHONPATH="$LIB_DIR:$PROTO_DIR" python3 "$LIB_DIR/lookup_proxy.py" \
-        --listen "0.0.0.0:$LOOKUP_PROXY_PORT" \
-        --ic-server "$IC_SERVER_GRPC" \
-        --replicas "$replicas_csv" \
-        --tokenizer "$LOOKUP_PROXY_TOKENIZER" \
-        --tenant "${LOOKUP_PROXY_TENANT:-$WORKLOAD_NAMESPACE}" \
-        "${replica_args[@]}" \
-        "${extra_args[@]}" \
-        --log "$outdir/lookup_proxy.log" &
       PROXY_PID=$!
-      sleep 3  # tokenizer load takes a moment; subscriber tasks attaching
-      kill -0 "$PROXY_PID" 2>/dev/null || die "lookup proxy failed to start; see $outdir/lookup_proxy.log"
+      sleep 3  # tokenizer load takes a moment
+      kill -0 "$PROXY_PID" 2>/dev/null || die "$client_label failed to start; see $outdir/${client_label}.log"
       target_url="http://localhost:$LOOKUP_PROXY_PORT"
       ;;
     *) die "unknown mode: $mode (use baseline | no-hint | lookup)";;

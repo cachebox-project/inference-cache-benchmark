@@ -1,14 +1,15 @@
 """Pytest fixtures + import shims for the benchmark harness.
 
-The proxy module (`lib/lookup_proxy.py`) hard-imports the inference-cache
-gRPC stubs at module load time and `sys.exit(2)`s when they're missing.
-Generating them needs the sibling main repo (`make proto`) — far too heavy
-a dependency for a unit test. The shim below registers placeholder
-modules in `sys.modules` BEFORE pytest collects test files, so the
-`from inferencecache.v1alpha1 import ...` succeeds against fakes.
+Both the dumb client (`lib/dumb_gateway_client.py`, CAC-152) and the legacy
+proxy retained for one release (`lib/lookup_proxy_legacy.py`) hard-import
+the inference-cache gRPC stubs at module load time and `sys.exit(2)` when
+they're missing. Generating them needs the sibling main repo (`make proto`)
+— too heavy a dependency for a unit test. The shim below registers
+placeholder modules in `sys.modules` BEFORE pytest collects test files, so
+the `from inferencecache.v1alpha1 import ...` succeeds against fakes.
 
-Adds `lib/` to `sys.path` so tests can `from lookup_proxy import ...`
-matching the way `python3 lib/lookup_proxy.py` runs it in production.
+Adds `lib/` to `sys.path` so tests can `from dumb_gateway_client import ...`
+matching the way `python3 lib/dumb_gateway_client.py` runs it in production.
 """
 
 from __future__ import annotations
