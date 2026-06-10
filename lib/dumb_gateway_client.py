@@ -10,8 +10,8 @@ This client mirrors that contract — nothing more (CAC-152).
   1. Tokenize the prompt with the configured HF tokenizer (Llama-3.1 chat
      template for chat-completions, raw encode for completions).
   2. Chunk the token sequence into ``block_size``-token blocks and emit
-     content-addressed block hashes (sha256 of parent_hash || token_bytes,
-     truncated to 8 bytes).
+     content-addressed block hashes (XXH3-64 rolling prefix hash, seed 1337),
+     byte-identical to the inference-cache subscriber and SMG.
   3. Call ``LookupRoute(tenant, model, block_hashes, block_token_counts)``.
   4. Route:
        * ``PREFIX_MATCH`` → ``replica_scores[0].replica_id`` (resolved to URL)
@@ -54,14 +54,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import logging
+import struct
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
+import xxhash
 from aiohttp import web
 
 try:
@@ -92,36 +93,54 @@ DEFAULT_LOOKUP_TIMEOUT_S = 0.5
 DEFAULT_TOKENIZER = "unsloth/Meta-Llama-3.1-8B-Instruct"
 
 
+_XXH3_SEED = 1337
+
+
+def _content_hash(block_tokens: List[int]) -> int:
+    """Position-independent XXH3-64 (seed 1337) over the little-endian u32
+    encoding of each token. Matches the inference-cache subscriber / SMG
+    ``compute_content_hash``."""
+    buf = b"".join(struct.pack("<I", t & 0xFFFFFFFF) for t in block_tokens)
+    return xxhash.xxh3_64_intdigest(buf, seed=_XXH3_SEED)
+
+
+def _next_seq_hash(prev: int, content: int) -> int:
+    """Roll the prefix hash forward one block: XXH3-64(seed 1337) over
+    ``prev.le8 ++ content.le8`` (matches SMG ``compute_next_seq_hash``)."""
+    return xxhash.xxh3_64_intdigest(
+        struct.pack("<Q", prev) + struct.pack("<Q", content), seed=_XXH3_SEED
+    )
+
+
 def _hash_blocks(
     token_ids: List[int], block_size: int
 ) -> Tuple[List[bytes], List[int]]:
     """Chunk ``token_ids`` into ``block_size``-token blocks and content-address them.
 
-    Each block's hash is ``sha256(parent_hash || token_bytes)[:8]`` — the
-    canonical content-addressed scheme used by engines configured for
-    reproducible KV-cache hashing. The first block's parent is 8 zero bytes.
-    Partial trailing tokens (< block_size) are dropped so the chain only
-    contains blocks the engine would have committed to its index.
+    Each block's key is the rolling positional prefix hash:
+    ``prefix[0] = content_hash(block_0)`` and
+    ``prefix[i] = xxh3(prefix[i-1].le8 || content_hash(block_i).le8)`` — XXH3-64
+    with seed 1337, serialized 8-byte big-endian. This is byte-identical to the
+    inference-cache subscriber's ingest hash and SMG's ``event_tree.rs``, so the
+    server's index (keyed on the subscriber's hash) matches what we send here.
+    Partial trailing tokens (< block_size) are dropped so the chain only contains
+    blocks the engine would have committed to its index.
 
-    Why content-addressed: the production gateway can recompute hashes from
-    the prompt alone — no engine-event observation is required. Same prompt
-    on any pod yields the same block-hash chain, so LookupRoute can match
-    against the server's index without the ZMQ-subscription dance the legacy
-    proxy needs.
+    Why content-addressed: the gateway recomputes hashes from the prompt alone —
+    no engine-event observation required. The engine's own block hash is seeded
+    per-process (vLLM NONE_HASH) and so is NOT reproducible; this content
+    fingerprint is, which is exactly why the index keys on it.
     """
     block_hashes: List[bytes] = []
     block_counts: List[int] = []
-    parent = b"\x00" * 8
     n_full = (len(token_ids) // block_size) * block_size
+    prev: Optional[int] = None
     for i in range(0, n_full, block_size):
-        chunk = token_ids[i : i + block_size]
-        token_bytes = b"".join(
-            (t & 0xFFFFFFFF).to_bytes(4, "little", signed=False) for t in chunk
-        )
-        digest = hashlib.sha256(parent + token_bytes).digest()[:8]
-        block_hashes.append(digest)
+        content = _content_hash(token_ids[i : i + block_size])
+        prefix = content if prev is None else _next_seq_hash(prev, content)
+        block_hashes.append(prefix.to_bytes(8, "big"))
         block_counts.append(block_size)
-        parent = digest
+        prev = prefix
     return block_hashes, block_counts
 
 
