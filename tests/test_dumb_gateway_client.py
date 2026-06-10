@@ -15,7 +15,6 @@ state. Tests focus on:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from collections import Counter
 from typing import List, Tuple
 from unittest.mock import MagicMock, patch
@@ -76,26 +75,21 @@ def test_hash_blocks_chain_is_content_addressed():
     assert ha[2] != hc[2]    # diverges in the last block
 
 
-def test_hash_blocks_chains_parent_into_child():
-    """block_hash[i] = sha256(block_hash[i-1] || token_bytes_block_i)[:8].
+def test_hash_blocks_matches_xxh3_golden():
+    """block_hash[i] is the XXH3-64 rolling prefix hash (seed 1337), 8-byte
+    big-endian, byte-identical to the inference-cache subscriber and SMG.
 
-    Validates the chain explicitly so a future change to the algorithm
-    (e.g. swapping in a different digest) is loud.
+    Golden values pin cross-impl parity: tokens [0..31] with block_size 16 —
+    prefix[0] = content_hash([0..15]); prefix[1] = next_seq(prefix[0],
+    content_hash([16..31])). A change to the construction (algorithm, seed,
+    byte order, or chaining) is loud here, and a divergence from the Go
+    subscriber would break LookupRoute matching.
     """
-    tokens = list(range(DEFAULT_BLOCK_SIZE * 2))
+    assert DEFAULT_BLOCK_SIZE == 16  # golden values below assume bs=16
+    tokens = list(range(DEFAULT_BLOCK_SIZE * 2))  # [0..31] -> 2 blocks
     hashes, _ = _hash_blocks(tokens, DEFAULT_BLOCK_SIZE)
-    expected0_bytes = b"".join(
-        (t & 0xFFFFFFFF).to_bytes(4, "little", signed=False)
-        for t in range(DEFAULT_BLOCK_SIZE)
-    )
-    expected0 = hashlib.sha256(b"\x00" * 8 + expected0_bytes).digest()[:8]
-    assert hashes[0] == expected0
-    expected1_bytes = b"".join(
-        (t & 0xFFFFFFFF).to_bytes(4, "little", signed=False)
-        for t in range(DEFAULT_BLOCK_SIZE, 2 * DEFAULT_BLOCK_SIZE)
-    )
-    expected1 = hashlib.sha256(expected0 + expected1_bytes).digest()[:8]
-    assert hashes[1] == expected1
+    assert hashes[0] == (15310707395893867146).to_bytes(8, "big")
+    assert hashes[1] == (13769157705258532664).to_bytes(8, "big")
 
 
 # ---- _parse_replica --------------------------------------------------------

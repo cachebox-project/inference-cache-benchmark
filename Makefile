@@ -59,7 +59,7 @@ install:
 	  genai-bench \
 	  'grpcio>=1.60' grpcio-tools \
 	  aiohttp pandas pyyaml requests \
-	  pyzmq 'msgspec>=0.18' \
+	  pyzmq 'msgspec>=0.18' xxhash \
 	  transformers sentencepiece \
 	  pytest pytest-asyncio
 
