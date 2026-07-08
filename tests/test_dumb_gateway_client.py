@@ -323,15 +323,15 @@ async def test_lookup_route_timeout_returns_none_and_increments_stat():
 
 
 class _FakeContent:
-    async def iter_chunked(self, _n):
+    async def iter_any(self):
         yield b'{"ok":true}'
 
 
 class _FakeResp:
-    def __init__(self):
-        self.status = 200
-        self.headers = {"Content-Type": "application/json"}
-        self.content = _FakeContent()
+    def __init__(self, status=200, headers=None, content=None):
+        self.status = status
+        self.headers = headers if headers is not None else {"Content-Type": "application/json"}
+        self.content = content if content is not None else _FakeContent()
 
     async def __aenter__(self):
         return self
@@ -341,12 +341,13 @@ class _FakeResp:
 
 
 class _FakeSession:
-    def __init__(self):
+    def __init__(self, resp_factory=None):
         self.calls: List[str] = []
+        self._resp_factory = resp_factory or (lambda: _FakeResp())
 
     def post(self, url, **_kw):
         self.calls.append(url)
-        return _FakeResp()
+        return self._resp_factory()
 
     async def close(self):
         pass
@@ -477,3 +478,78 @@ async def test_lookup_mode_no_hint_falls_back_to_round_robin():
     assert client.stats["lookup_no_hint"] == 30
     assert client.stats["routed_round_robin_fallback"] == 30
     assert client.stats["routed_to_hint"] == 0
+
+
+# ---- forward() streaming resilience ----------------------------------------
+
+
+class _FailMidStreamContent:
+    """Yields one SSE chunk, then the upstream connection dies."""
+
+    async def iter_any(self):
+        yield b"data: partial\n\n"
+        raise ConnectionResetError("upstream closed mid-stream")
+
+
+async def _drive_one_request(client, resp_factory):
+    """POST one request through handle_chat against a fake upstream; return
+    (status, headers, body) as the downstream client observed them."""
+    await client.setup()
+    fake = _FakeSession(resp_factory=resp_factory)
+    client._client_session = fake  # type: ignore[assignment]
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", client.handle_chat)
+    server = TestServer(app)
+    http = TestClient(server)
+    await http.start_server()
+    try:
+        r = await http.post("/v1/chat/completions", json={"model": "m", "prompt": "hi"})
+        body = await r.read()
+        return r.status, r.headers, body
+    finally:
+        await http.close()
+        await client.teardown()
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_stream_cleanly_on_midstream_failure():
+    """Upstream dies AFTER the response is committed (prepared). The old code
+    did `return web.Response(502)`, injecting a raw HTTP status into the chunked
+    body → the client saw InvalidChunkLength and dropped the stream. The fix
+    closes the truncated stream cleanly: status 200 + the partial bytes, and
+    never a 502 / 'upstream error' payload smuggled mid-stream."""
+    client = _build(routing_mode="round-robin")
+    status, _headers, body = await _drive_one_request(
+        client, lambda: _FakeResp(status=200, content=_FailMidStreamContent())
+    )
+    assert status == 200                  # committed before the failure
+    assert b"partial" in body             # bytes sent pre-failure survive
+    assert b"upstream error" not in body  # no 502 payload injected mid-stream
+    assert b"502" not in body
+
+
+@pytest.mark.asyncio
+async def test_forward_strips_hop_by_hop_response_headers():
+    """A passed-through Content-Length / Transfer-Encoding / Content-Encoding
+    from the upstream corrupts the re-chunked StreamResponse (declared length
+    never matches the bytes we re-emit). The fix strips them; the client must
+    not echo the upstream's bogus length/encoding, and the body arrives intact."""
+    client = _build(routing_mode="round-robin")
+    upstream_headers = {
+        "Content-Type": "application/json",
+        "Content-Length": "999999",   # bogus vs the 11 bytes actually emitted
+        "Transfer-Encoding": "chunked",
+        "Content-Encoding": "gzip",   # body is NOT gzip -> would break the client
+    }
+    status, headers, body = await _drive_one_request(
+        client, lambda: _FakeResp(status=200, headers=upstream_headers)
+    )
+    assert status == 200
+    assert body == b'{"ok":true}'                       # full body delivered intact
+    assert headers.get("Content-Length") != "999999"    # bogus length stripped
+    assert "gzip" not in (headers.get("Content-Encoding") or "")
+    assert headers.get("Content-Type") == "application/json"  # non-hop header preserved
