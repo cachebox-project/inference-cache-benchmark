@@ -403,34 +403,55 @@ class DumbGatewayClient:
         }
         logging.info("route_decision %s", log_extra)
 
+        assert self._client_session is not None
+        fwd_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in {"host", "content-length"}
+        }
+        # genai-bench hits both /v1/chat/completions and /v1/completions;
+        # forward to whichever path was requested so the upstream sees
+        # the same payload shape it would in production.
+        upstream_path = request.match_info.get("path") or request.path
+        # Hop-by-hop response headers must NOT be copied onto a re-chunked
+        # StreamResponse: a passed-through Content-Length / Transfer-Encoding /
+        # Content-Encoding from the upstream corrupts the body we re-emit.
+        _HOP = {"content-length", "transfer-encoding", "content-encoding", "connection"}
+        stream: Optional[web.StreamResponse] = None
         try:
-            assert self._client_session is not None
-            fwd_headers = {
-                k: v for k, v in request.headers.items()
-                if k.lower() not in {"host", "content-length"}
-            }
-            # genai-bench hits both /v1/chat/completions and /v1/completions;
-            # forward to whichever path was requested so the upstream sees
-            # the same payload shape it would in production.
-            upstream_path = request.match_info.get("path") or request.path
             async with self._client_session.post(
                 f"{upstream_url}{upstream_path}",
                 data=body,
                 headers=fwd_headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as upstream_resp:
+                resp_headers = {
+                    k: v for k, v in upstream_resp.headers.items()
+                    if k.lower() not in _HOP
+                }
                 stream = web.StreamResponse(
-                    status=upstream_resp.status, headers=upstream_resp.headers
+                    status=upstream_resp.status, headers=resp_headers
                 )
                 stream.headers["X-Cache-Lookup-Reason"] = reason
                 stream.headers["X-Cache-Route-Reason"] = route_reason
                 await stream.prepare(request)
-                async for chunk in upstream_resp.content.iter_chunked(8192):
+                async for chunk in upstream_resp.content.iter_any():
                     await stream.write(chunk)
                 await stream.write_eof()
                 return stream
         except Exception as e:
+            # Once the response is committed to the client mid-stream we CANNOT
+            # send a new status line. The old code did `return web.Response(502)`
+            # here, which injects a raw "HTTP/1.1 502 ..." into the chunked body;
+            # the client then sees an InvalidChunkLength and drops the stream
+            # (the concurrent-SSE-drop bug). Close the truncated stream cleanly
+            # instead; only a failure BEFORE prepare() can still return a 502.
             logging.exception("forward failed")
+            if stream is not None and stream.prepared:
+                try:
+                    await stream.write_eof()
+                except Exception:
+                    pass
+                return stream
             return web.Response(status=502, text=f"upstream error: {e}")
 
     async def handle_metrics(self, _: web.Request) -> web.Response:
