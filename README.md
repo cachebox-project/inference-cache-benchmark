@@ -144,7 +144,15 @@ disown
 tail -f /tmp/oci-session-refresher.log
 ```
 
-For pod-targeted PFs whose pod names can change after a restart (e.g. the per-replica `:5557` ZMQ ports used by `lookup` mode), the config can define a `resolve_pf_specs` shell function that's called each tick to rebuild `PF_SPECS` from `kubectl get pod` output. See the commented-out block at the bottom of the example config for the pattern.
+For pod-targeted PFs whose pod names can change after a restart (e.g. the per-replica HTTP/ZMQ ports used by `lookup` mode), the config can define a `resolve_pf_specs` shell function that's called each tick to rebuild `PF_SPECS` from `kubectl get pod` output. See the commented-out block at the bottom of the example config for the pattern.
+
+The benchmark orchestrator also uses the refresher directly after rollout restarts:
+
+```bash
+FORCE_RESTART_PFS=1 scripts/oci-session-refresher.sh --once ~/.oci-session-refresher.conf
+```
+
+That one-shot mode tears down and recreates every configured kubectl port-forward immediately, so per-pod forwards reconnect to the new pods before the next measured run.
 
 To validate restore behavior end-to-end without waiting on a real PF to die: launch the refresher with `INTERVAL=10`, find a kubectl PF process with `pgrep -fl 'kubectl.*port-forward'`, `kill -9` it, and watch the next tick log a `— restored: <port>` entry.
 
@@ -168,6 +176,8 @@ Produces `results/current-<timestamp>/`:
 - `dataset.txt` — dataset fingerprint (path, SHA-256, line count, first-prompt
   head, generator config) — only written when the scenario uses `dataset_path`
 - `cluster-state.yaml` — pod + node + event snapshot for the run window (see below)
+- `kubectl-top-pods-start-<namespace>.txt` / `kubectl-top-pods-end-<namespace>.txt` — best-effort `kubectl top pod` snapshots for the configured `CLUSTER_STATE_TARGETS` namespaces
+- `vllm-metrics-before.csv` / `vllm-metrics-after.csv` — one-shot pre/post vLLM metric scrapes for exact T1/T2 counter deltas when vLLM endpoints are configured
 
 ### cluster-state.yaml — why it's there
 
@@ -190,6 +200,10 @@ Per run, the harness captures:
   via `kubectl get events --field-selector involvedObject.namespace=<ns>`.
 - **`nodes`** — capacity, allocatable, and pressure conditions for every node
   hosting one of the captured pods.
+
+The `kubectl-top-pods-*` files pair with the restart-count snapshot: restart
+deltas show pod churn, while `kubectl top pod` gives a quick signal for
+run-window CPU/memory throttling or memory pressure.
 
 Which pods to capture is controlled by `CLUSTER_STATE_TARGETS`, a
 comma-separated list of `<namespace>:<name-prefix>` pairs. The default targets
@@ -254,9 +268,13 @@ For the brown-bag headline benchmark, three new scenarios live alongside
 Each scenario specifies four concurrency points (`[4, 8, 16, 32]`); the
 `scripts/phase3-sweep.sh` orchestrator runs all three across the three modes
 (`baseline` / `no-hint` / `lookup`) and four iterations (`cold`, `warm-1`,
-`warm-2`, `warm-3`). Cold iters do a `kubectl rollout restart` between runs;
-warm iters reuse the cache state from the previous run to capture warmup →
-steady-state transitions.
+`warm-2`, `warm-3`). Before each scenario/mode group it does a mode-boundary
+reset: restart the relevant deployment(s), force configured port-forwards to
+reconnect through `scripts/oci-session-refresher.sh --once`, and run a tiny
+warm-start (`MODE_WARMUP_REQUESTS`, default `5`) before the first measured
+iteration. Warm iterations within the same mode do **not** restart pods; they
+reuse the previous iteration's state to capture warmup → steady-state
+transitions.
 
 ```bash
 # Generate datasets first (one-time):
@@ -275,6 +293,9 @@ scripts/phase3-sweep.sh --scenarios "perfect-storm-rag" --iters "cold warm-1"
 # Dry-run (echo commands without executing):
 scripts/phase3-sweep.sh --dry-run
 
+# Disable mode-boundary restarts/PF rebuilds/warmup for a targeted rerun:
+scripts/phase3-sweep.sh --skip-mode-reset --scenarios "perfect-storm-rag" --iters "warm-2"
+
 # Build comparison reports only (skips re-running):
 scripts/phase3-sweep.sh --compare-only
 ```
@@ -283,7 +304,8 @@ Interpreting the output:
 
 - Each iteration writes a `results/phase3-<scenario>-<mode>-<iter>-<ts>/`
   directory with the usual `report.md`, `ic-metrics.csv`,
-  `vllm-metrics.csv` (Phase 3), `cluster-state.yaml`, etc.
+  `vllm-metrics.csv` (Phase 3), one-shot `vllm-metrics-before/after.csv`,
+  `kubectl-top-pods-*`, `cluster-state.yaml`, etc.
 - The orchestrator builds a three-way comparison per scenario at the end
   (`results/compare-phase3-<scenario>-{baseline,no-hint,lookup}-cold-<ts>.md`),
   using the `cold` iters as the headline numbers.

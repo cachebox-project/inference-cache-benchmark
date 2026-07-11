@@ -16,7 +16,7 @@
 # because the PFs underneath had quietly died. See CAC-162.
 #
 # Usage:
-#   oci-session-refresher.sh [config-file]
+#   oci-session-refresher.sh [--once] [config-file]
 #
 # Config file is sourced as bash. It can set:
 #   PROFILE        OCI session profile      (default: BoatOc1)
@@ -39,6 +39,10 @@
 #     "38005|-n gpu-baseline    port-forward svc/vllm-baseline          :8000"
 #   )
 #
+# Set FORCE_RESTART_PFS=1 with --once to intentionally tear down and recreate
+# every configured kubectl port-forward. Benchmark orchestrators use this after
+# pod rollouts so pod-targeted forwards reconnect to the new pod names.
+#
 # A missing or empty config means "session refresh only" — backward-compatible
 # with the original /tmp/oci-session-refresher.sh that did just `oci session
 # refresh` and nothing else.
@@ -49,6 +53,11 @@ set -o pipefail   # not -u: many code paths use optionally-set vars and empty ar
 PROFILE="${PROFILE:-BoatOc1}"
 INTERVAL="${INTERVAL:-1800}"
 PF_LOG_DIR="${PF_LOG_DIR:-/tmp}"
+RUN_ONCE=0
+if [[ "${1:-}" == "--once" ]]; then
+    RUN_ONCE=1
+    shift
+fi
 CONFIG="${1:-${REFRESHER_CONFIG:-$HOME/.oci-session-refresher.conf}}"
 PF_SPECS=()
 
@@ -76,8 +85,9 @@ pf_listening() {
 }
 
 # Kill any kubectl port-forward whose argv contains "<port>:" — i.e. the
-# stale process that owned this local port. We only get here when the port
-# is not LISTEN, so any such process is hung/dying and safe to terminate.
+# stale process that owned this local port. Normal health checks call this only
+# when the port is not LISTEN; forced benchmark resets call it intentionally to
+# reconnect pod-targeted PFs after rollouts.
 kill_stale_kubectl_for_port() {
     local port=$1 pids
     pids=$(ps -eo pid,command 2>/dev/null \
@@ -143,7 +153,7 @@ check_pfs() {
         # shellcheck disable=SC2206
         local args=($rest)   # word-split is intentional here
 
-        if pf_listening "$port"; then
+        if [[ "${FORCE_RESTART_PFS:-0}" != "1" ]] && pf_listening "$port"; then
             alive=$((alive+1))
             continue
         fi
@@ -175,6 +185,11 @@ check_pfs() {
 trap 'echo "[$(ts)] caught signal, exiting"; exit 0' INT TERM
 
 echo "[$(ts)] starting; profile=$PROFILE interval=${INTERVAL}s specs=${#PF_SPECS[@]} dynamic=$(declare -f resolve_pf_specs >/dev/null && echo yes || echo no)"
+if [[ "$RUN_ONCE" == "1" ]]; then
+    refresh_session
+    check_pfs
+    exit 0
+fi
 while true; do
     refresh_session
     check_pfs

@@ -35,6 +35,11 @@
 #                             per mode — baseline=VLLM_BASELINE_URL/metrics for
 #                             baseline mode, the LOOKUP_PROXY_REPLICAS http urls
 #                             for no-hint/lookup modes.) Set explicitly to override.
+#   BENCH_WARMUP_REQUESTS   — optional tiny pre-run request count before measured
+#                             traffic starts (default: 0 = disabled). Orchestrators
+#                             set this to 5 after mode-boundary pod restarts.
+#   BENCH_WARMUP_CONCURRENCY — concurrency for BENCH_WARMUP_REQUESTS (default: 1)
+#   BENCH_WARMUP_MAX_TIME   — max seconds for the warmup genai-bench run (default: 120)
 #
 # See README.md for the full design.
 
@@ -64,6 +69,9 @@ PROTO_DIR="${INFERENCE_CACHE_PROTO_DIR:-$ROOT/proto}"
 : "${CLUSTER_STATE_EVENTS_NS:=}"
 : "${VLLM_METRICS_ENDPOINTS:=}"
 : "${VLLM_METRICS_INTERVAL:=30}"
+: "${BENCH_WARMUP_REQUESTS:=0}"
+: "${BENCH_WARMUP_CONCURRENCY:=1}"
+: "${BENCH_WARMUP_MAX_TIME:=120}"
 
 # -------- helpers --------
 color_g() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -112,6 +120,50 @@ build_cluster_state_event_ns() {
   done
   # shellcheck disable=SC2034
   eval "$_outvar=(\"\${_args[@]}\")"
+}
+
+# Compute the unique namespace set in CLUSTER_STATE_TARGETS. Writes raw
+# namespace names to the caller-named array.
+build_cluster_state_namespaces() {
+  local _outvar="$1" _val="$2"
+  local -a _args=()
+  local _seen=" "
+  IFS=',' read -ra _entries <<< "$_val"
+  for e in "${_entries[@]}"; do
+    local ns="${e%%:*}"
+    ns="${ns#"${ns%%[![:space:]]*}"}"
+    ns="${ns%"${ns##*[![:space:]]}"}"
+    [[ -z "$ns" ]] && continue
+    case "$_seen" in
+      *" $ns "*) ;;
+      *) _args+=("$ns"); _seen+="$ns " ;;
+    esac
+  done
+  # shellcheck disable=SC2034
+  eval "$_outvar=(\"\${_args[@]}\")"
+}
+
+capture_kubectl_top_pods() {
+  local outdir="$1" suffix="$2"
+  local -a namespaces=()
+  build_cluster_state_namespaces namespaces "$CLUSTER_STATE_TARGETS"
+  for ns in "${namespaces[@]}"; do
+    local out="$outdir/kubectl-top-pods-${suffix}-${ns}.txt"
+    kubectl -n "$ns" top pod > "$out" 2>"$out.err" \
+      || color_y "  (kubectl top pod failed for namespace $ns — see $out.err)"
+  done
+}
+
+capture_vllm_metrics_snapshot() {
+  local out="$1"; shift
+  if (( $# == 0 )); then
+    return 0
+  fi
+  python3 "$LIB_DIR/collect_vllm_metrics.py" \
+    "$@" \
+    --once \
+    --output "$out" \
+    || color_y "  (vLLM metrics snapshot failed — continuing)"
 }
 
 cmd_list_scenarios() {
@@ -205,6 +257,7 @@ Generate it first (see the scenario's description for the generator command)."
     "${CLUSTER_STATE_TARGET_ARGS[@]}" \
     --output "$outdir/.cluster-state-start.json" \
     || color_y "  (cluster-state start snapshot failed — continuing)"
+  capture_kubectl_top_pods "$outdir" "start"
 
   # ---- pick the target URL for this mode ----
   # no-hint and lookup both route through the dumb gateway client so
@@ -307,6 +360,38 @@ Generate it first (see the scenario's description for the generator command)."
     *) die "unknown mode: $mode (use baseline | no-hint | lookup)";;
   esac
 
+  # ---- optional warm-start before measured traffic ----
+  # Used by orchestrators after a rollout restart so CUDA graph/JIT warmup
+  # doesn't pollute the measured run. This intentionally runs before the
+  # IC/vLLM metric scrapers and distribution snapshots start.
+  if [[ "$BENCH_WARMUP_REQUESTS" =~ ^[0-9]+$ ]] && (( BENCH_WARMUP_REQUESTS > 0 )); then
+    color_g "      Warm-starting target with ${BENCH_WARMUP_REQUESTS} request(s)"
+    local -a warmup_args=(
+      "benchmark"
+      "--api-backend" "openai"
+      "--api-base"    "$target_url"
+      "--api-key"     "${API_KEY:-dummy}"
+      "--api-model-name" "$model"
+      "--model-tokenizer" "$tokenizer"
+      "--task" "$task"
+      "--max-requests-per-run" "$BENCH_WARMUP_REQUESTS"
+      "--max-time-per-run"     "$BENCH_WARMUP_MAX_TIME"
+      "--server-engine" "vLLM"
+      "--experiment-folder-name" "${outdir}/genai-bench-warmup"
+      "--num-concurrency" "$BENCH_WARMUP_CONCURRENCY"
+    )
+    if [[ -n "$dataset_path" ]]; then
+      warmup_args+=("--dataset-path" "$dataset_path")
+    else
+      for s in $scenarios; do warmup_args+=("--traffic-scenario" "$s"); done
+      [[ -n "$prefix_len" ]] && warmup_args+=("--prefix-len" "$prefix_len")
+    fi
+    genai-bench "${warmup_args[@]}" > "$outdir/genai-bench-warmup.log" 2>&1 \
+      || color_y "  (warmup failed — continuing to measured run; see $outdir/genai-bench-warmup.log)"
+  elif [[ ! "$BENCH_WARMUP_REQUESTS" =~ ^[0-9]+$ ]]; then
+    color_y "  (BENCH_WARMUP_REQUESTS=$BENCH_WARMUP_REQUESTS is not numeric — skipping warmup)"
+  fi
+
   # ---- start ic-metrics scraper in the background ----
   color_g "[5/7] Starting IC metrics scraper (every ${scrape_interval}s)"
   python3 "$LIB_DIR/collect_ic_metrics.py" \
@@ -342,6 +427,7 @@ Generate it first (see the scenario's description for the generator command)."
     done
   fi
   if (( ${#vllm_endpoint_args[@]} > 0 )); then
+    capture_vllm_metrics_snapshot "$outdir/vllm-metrics-before.csv" "${vllm_endpoint_args[@]}"
     color_g "      vLLM metrics scraper: ${#vllm_endpoint_args[@]} endpoint(s), every ${VLLM_METRICS_INTERVAL}s"
     python3 "$LIB_DIR/collect_vllm_metrics.py" \
       "${vllm_endpoint_args[@]}" \
@@ -394,6 +480,9 @@ Generate it first (see the scenario's description for the generator command)."
   sleep 2
   kill "$SCRAPER_PID" 2>/dev/null
   [[ -n "${VLLM_SCRAPER_PID:-}" ]] && kill "$VLLM_SCRAPER_PID" 2>/dev/null
+  if (( ${#vllm_endpoint_args[@]} > 0 )); then
+    capture_vllm_metrics_snapshot "$outdir/vllm-metrics-after.csv" "${vllm_endpoint_args[@]}"
+  fi
 
   # ---- post-run distribution check (CAC-163) ----
   # Exit-code semantics: 0 = ok/skipped/idle, 2 = imbalanced. We capture the
@@ -413,6 +502,7 @@ Generate it first (see the scenario's description for the generator command)."
     "${CLUSTER_STATE_TARGET_ARGS[@]}" \
     --output "$outdir/.cluster-state-end.json" \
     || color_y "  (cluster-state end snapshot failed — continuing)"
+  capture_kubectl_top_pods "$outdir" "end"
   local -a CLUSTER_STATE_EVENT_ARGS=()
   if [[ -n "$CLUSTER_STATE_EVENTS_NS" ]]; then
     IFS=',' read -ra _ens <<< "$CLUSTER_STATE_EVENTS_NS"

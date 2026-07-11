@@ -21,7 +21,8 @@ PF_SPECS=(
 # vLLM engine pods are part of a StatefulSet, so their names can change after
 # a restart (vllm-engine-0 → vllm-engine-0 usually stays, but the lookup is
 # still safer than hardcoding). If you define resolve_pf_specs, it's called
-# at every tick and replaces PF_SPECS entirely.
+# at every tick and during `FORCE_RESTART_PFS=1 ... --once`; it replaces
+# PF_SPECS entirely.
 #
 # resolve_pf_specs() {
 #     local kc_args=()
