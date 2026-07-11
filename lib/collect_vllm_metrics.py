@@ -40,6 +40,13 @@ Usage
     --endpoint r2=http://localhost:38012/metrics \\
     --interval 30 \\
     --output results/.../vllm-metrics.csv
+
+For exact pre/post-run deltas, use ``--once`` to write a single scrape row:
+
+  python3 collect_vllm_metrics.py \\
+    --endpoint r0=http://localhost:38010/metrics \\
+    --once \\
+    --output results/.../vllm-metrics-before.csv
 """
 
 from __future__ import annotations
@@ -126,6 +133,11 @@ def main():
     )
     ap.add_argument("--interval", type=int, default=30)
     ap.add_argument("--output", required=True)
+    ap.add_argument(
+        "--once",
+        action="store_true",
+        help="Scrape once, write one CSV row, and exit.",
+    )
     args = ap.parse_args()
 
     endpoints: List[Tuple[str, str]] = [parse_endpoint(e) for e in args.endpoint]
@@ -167,6 +179,8 @@ def main():
                 writer.writerow(row)
             assert writer is not None
             f.flush()
+            if args.once:
+                break
             for _ in range(args.interval):
                 if stop["flag"]:
                     break
